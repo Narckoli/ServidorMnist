@@ -15,6 +15,8 @@ class WorkerInfo:
     current_grads: Optional[Dict[str, Any]] = None
     current_loss: Optional[float] = None
     epoch_completed: asyncio.Event = field(default_factory=asyncio.Event)
+    ready_for_training: bool = False  
+    setup_completed: asyncio.Event = field(default_factory=asyncio.Event)  
     
     def mark_epoch_done(self, grads: Dict, loss: float):
         self.current_grads = grads
@@ -90,9 +92,10 @@ class TrainingState:
         if all(self.workers_ready_for_epoch.values()):
             self.all_workers_ready.set()
     
-    def all_workers_ready_for_epoch(self) -> bool:
-        """Verifica si todos los workers están listos."""
-        return len(self.workers_ready_for_epoch) == self.expected_workers and \
-               all(self.workers_ready_for_epoch.values())
+    def all_workers_ready_for_training(self) -> bool:  
+        """Verifica si todos los workers completaron su setup inicial."""
+        if len(self.workers) < self.expected_workers:
+            return False
+        return all(w.ready_for_training for w in self.workers.values())
 # Instancia global
 state = TrainingState()

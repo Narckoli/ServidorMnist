@@ -70,8 +70,24 @@ async def handle_worker(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         })
         print(f"[Worker {worker_id}] ✓ Chunk de {len(dataset_chunk)} muestras enviado")
         
-        # 3. ESPERAR hasta que todos los workers estén conectados
-        #    (esto lo maneja el servidor principal)
+        # 3. ESPERAR a que el worker cargue sus datos y esté listo
+        # El worker enviará un mensaje "ready" cuando termine su setup
+        print(f"[Worker {worker_id}] ⏳ Esperando que el worker complete su setup...")
+        
+        ready_msg = await recv_json(reader)
+        if ready_msg and ready_msg.get("type") == "worker_ready":
+            worker_info.mark_ready()
+            print(f"[Worker {worker_id}] ✓ Worker listo para entrenar")
+        else:
+            print(f"[Worker {worker_id}] ❌ No se recibió confirmación de ready")
+            return
+        
+        # 4. ESPERAR hasta que TODOS los workers estén listos
+        print(f"[Worker {worker_id}] ⏳ Esperando a que todos los workers estén listos...")
+        while not state.all_workers_ready_for_training():
+            await asyncio.sleep(0.5)
+        
+        print(f"[Worker {worker_id}] 🎯 ¡Todos los workers listos! Comenzando entrenamiento...")
         
         # 4. Bucle de épocas
         for epoch in range(state.max_epochs):
