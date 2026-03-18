@@ -70,5 +70,29 @@ class TrainingState:
                 worker_losses.append(w.current_loss)
         return all_grads, worker_losses
 
+    #Variables y funciones para sincronización
+    workers_ready_for_epoch: Dict[int, bool] = field(default_factory=dict)
+    current_epoch_weights: Optional[Dict[str, np.ndarray]] = None  # Pesos con los que empezó la época
+    
+    def reset_epoch_sync(self):
+        """Prepara la sincronización para una nueva época."""
+        self.all_workers_ready.clear()
+        self.workers_ready_for_epoch = {wid: False for wid in self.workers.keys()}
+        # Guardar los pesos con los que empezamos esta época
+        self.current_epoch_weights = self.global_weights.copy() if self.global_weights else None
+    
+    def mark_worker_ready(self, worker_id: int):
+        """Marca un worker como listo para esta época."""
+        if worker_id in self.workers_ready_for_epoch:
+            self.workers_ready_for_epoch[worker_id] = True
+        
+        # Verificar si todos están listos
+        if all(self.workers_ready_for_epoch.values()):
+            self.all_workers_ready.set()
+    
+    def all_workers_ready_for_epoch(self) -> bool:
+        """Verifica si todos los workers están listos."""
+        return len(self.workers_ready_for_epoch) == self.expected_workers and \
+               all(self.workers_ready_for_epoch.values())
 # Instancia global
 state = TrainingState()

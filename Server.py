@@ -70,40 +70,41 @@ async def main():
     # Preparar chunks para workers
     dataset_chunks = stratified_split(y_train, state.expected_workers)
     
-    # Contador de workers conectados
     connected_count = 0
+    connection_event = asyncio.Event()
     
     async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-        """Manejador de conexiones de clientes."""
         nonlocal connected_count
         connected_count += 1
         worker_id = connected_count
         chunk = dataset_chunks[worker_id - 1]
         
-        print(f"Worker {worker_id} conectado ({connected_count}/{state.expected_workers})")
-        await handle_worker(reader, writer, worker_id, chunk)
+        print(f"✓ Worker {worker_id} conectado ({connected_count}/{state.expected_workers})")
         
-        # Verificar si se perdió un worker durante el entrenamiento
-        if len(state.workers) < state.expected_workers and state.current_epoch < state.max_epochs:
-            print(f"ADVERTENCIA: Worker {worker_id} desconectado durante entrenamiento")
+        # Si ya tenemos todos los workers, avisar
+        if connected_count == state.expected_workers:
+            connection_event.set()
+        
+        await handle_worker(reader, writer, worker_id, chunk)
     
-    # Iniciar servidor
-    server = await asyncio.start_server(handle_client, state.HOST, state.PORT)
-    print(f"\nServidor iniciado en {state.HOST}:{state.PORT}")
-    print(f"Esperando {state.expected_workers} workers...")
-    
-    # Esperar a que todos se conecten
-    while connected_count < state.expected_workers:
-        await asyncio.sleep(0.1)
-    
-    print(f"\n✓ Todos los workers conectados. Iniciando entrenamiento...")
-    
-    # Ejecutar entrenamiento
-    await training_loop()
-    
-    # Cerrar servidor
-    server.close()
-    await server.wait_closed()
+        # Iniciar servidor
+        server = await asyncio.start_server(handle_client, state.HOST, state.PORT)
+        print(f"\nServidor iniciado en {state.HOST}:{state.PORT}")
+        print(f"Esperando {state.expected_workers} workers...")
+        
+        # ESPERAR a que TODOS los workers se conecten antes de empezar
+        await connection_event.wait()
+        print(f"\n🎯 ¡Todos los workers conectados! Iniciando entrenamiento sincronizado...")
+        
+        # Pequeña pausa para asegurar que todos están listos
+        await asyncio.sleep(1)
+        
+        # Iniciar training loop
+        await training_loop(state)
+        
+        # Cerrar servidor
+        server.close()
+        await server.wait_closed()
     
     # Mostrar tiempo total
     print_total_time()
