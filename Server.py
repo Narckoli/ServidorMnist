@@ -1,4 +1,4 @@
-# server.py
+# servidor/server.py
 import asyncio
 import time
 
@@ -70,10 +70,13 @@ async def main():
     # Preparar chunks para workers
     dataset_chunks = stratified_split(y_train, state.expected_workers)
     
+    # Contador de workers conectados
     connected_count = 0
-    connection_event = asyncio.Event()
+    # Evento para saber cuándo todos los workers están conectados
+    all_workers_connected = asyncio.Event()
     
     async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        """Manejador de conexiones de clientes."""
         nonlocal connected_count
         connected_count += 1
         worker_id = connected_count
@@ -83,35 +86,60 @@ async def main():
         
         # Si ya tenemos todos los workers, avisar
         if connected_count == state.expected_workers:
-            connection_event.set()
+            print("\n🎯 ¡Todos los workers conectados!")
+            all_workers_connected.set()
         
         await handle_worker(reader, writer, worker_id, chunk)
+        
+        # Verificar si se perdió un worker durante el entrenamiento
+        if len(state.workers) < state.expected_workers and state.current_epoch < state.max_epochs:
+            print(f"⚠️ ADVERTENCIA: Worker {worker_id} desconectado durante entrenamiento")
     
-        # Iniciar servidor
-        server = await asyncio.start_server(handle_client, state.HOST, state.PORT)
-        print(f"\nServidor iniciado en {state.HOST}:{state.PORT}")
-        print(f"Esperando {state.expected_workers} workers...")
+    # Iniciar servidor
+    server = await asyncio.start_server(handle_client, state.HOST, state.PORT)
+    print(f"\n🚀 Servidor iniciado en {state.HOST}:{state.PORT}")
+    print(f"⏳ Esperando {state.expected_workers} workers...")
+    print("   (Los workers deben ejecutar worker.py)")
+    
+    try:
+        # ESPERAR a que TODOS los workers se conecten (con timeout)
+        # Esperar hasta que se conecten todos o timeout después de 5 minutos
+        try:
+            await asyncio.wait_for(all_workers_connected.wait(), timeout=300.0)  # 5 minutos de timeout
+        except asyncio.TimeoutError:
+            print(f"\n❌ ERROR: Tiempo de espera agotado. Solo se conectaron {connected_count} de {state.expected_workers} workers.")
+            server.close()
+            await server.wait_closed()
+            return
         
-        # ESPERAR a que TODOS los workers se conecten antes de empezar
-        await connection_event.wait()
-        print(f"\n🎯 ¡Todos los workers conectados! Iniciando entrenamiento sincronizado...")
+        # Pequeña pausa para asegurar que todos los workers están listos
+        print("⏱️  Preparando inicio sincronizado...")
+        await asyncio.sleep(2)
         
-        # Pequeña pausa para asegurar que todos están listos
-        await asyncio.sleep(1)
+        print(f"\n{'='*60}")
+        print("🎯 ¡COMENZANDO ENTRENAMIENTO!")
+        print(f"{'='*60}")
         
-        # Iniciar training loop
+        # Ejecutar entrenamiento
         await training_loop(state)
         
+    except KeyboardInterrupt:
+        print("\n\n🛑 Servidor interrumpido por el usuario")
+    except Exception as e:
+        print(f"\n❌ Error en servidor: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
         # Cerrar servidor
         server.close()
         await server.wait_closed()
-    
-    # Mostrar tiempo total
-    print_total_time()
-    print("\nServidor finalizado")
+        
+        # Mostrar tiempo total
+        print_total_time()
+        print("\n👋 Servidor finalizado")
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n\nServidor interrumpido por el usuario")
+        print("\n\n👋 Servidor interrumpido por el usuario")

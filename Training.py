@@ -91,3 +91,19 @@ async def training_loop(state):
     print(f"\n{'='*60}")
     print("ENTRENAMIENTO COMPLETADO")
     print(f"{'='*60}")
+
+def mark_worker_ready(self, worker_id: int):
+    """Marca un worker como listo para esta época."""
+    if worker_id in self.workers_ready_for_epoch:
+        self.workers_ready_for_epoch[worker_id] = True
+    
+    # Verificar si todos están listos
+    if all(self.workers_ready_for_epoch.values()):
+        self.all_workers_ready.set()
+        if hasattr(self, 'current_epoch'):
+            print(f"\n🎯 ¡Todos los workers completaron la época {self.current_epoch + 1}!")
+
+def all_workers_ready_for_epoch(self) -> bool:
+    """Verifica si todos los workers están listos."""
+    return len(self.workers_ready_for_epoch) == self.expected_workers and \
+           all(self.workers_ready_for_epoch.values())
