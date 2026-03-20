@@ -1,4 +1,4 @@
-# training.py
+# servidor/Training.py
 import asyncio
 import time
 import numpy as np
@@ -7,8 +7,8 @@ from Config import state
 from Model import evaluate_model, average_gradients, apply_gradients
 from Metrics import plot_metrics
 
-async def training_loop(state):
-    """Loop principal con sincronización correcta."""
+async def training_loop():
+    """Loop principal de entrenamiento - VERSIÓN CORREGIDA."""
     state.training_start_time = time.time()
     print_interval = 50
     
@@ -16,17 +16,17 @@ async def training_loop(state):
     print("INICIO DE ENTRENAMIENTO")
     print(f"{'='*60}")
     
-    # Asegurar que todos los workers están conectados
-    print("Verificando conexión de todos los workers...")
-    while len(state.workers) < state.expected_workers:
+    # PRIMERO: Esperar a que TODOS los workers estén listos para entrenar
+    print("⏳ Esperando que todos los workers completen su setup...")
+    while not state.all_workers_ready_for_training():
         await asyncio.sleep(0.5)
-    print(f"✓ {len(state.workers)} workers conectados")
+    print("✓ Todos los workers listos!")
     
     for epoch in range(state.max_epochs):
         start_time = time.time()
         state.current_epoch = epoch
         
-        # PREPARAR NUEVA ÉPOCA
+        # Resetear sincronización para esta época
         state.reset_epoch_sync()
         
         should_print = (epoch + 1) % print_interval == 0 or epoch == 0 or epoch == state.max_epochs - 1
@@ -35,38 +35,33 @@ async def training_loop(state):
             print(f"\n{'='*60}")
             print(f'ÉPOCA {epoch + 1}/{state.max_epochs}')
             print(f"{'='*60}")
-            print("Enviando pesos a todos los workers...")
+            print("Esperando gradientes de todos los workers...")
         
-        # Enviar pesos a TODOS los workers (esto ya lo hace cada worker handler)
-        # Pero esperamos a que TODOS terminen
+        # NOTA: Los workers ya recibieron los pesos en handle_worker
+        # Solo esperamos a que todos completen
         
-        # ESPERAR a que todos los workers completen la época
+        # Esperar a que todos los workers completen
         await state.all_workers_ready.wait()
         
-        # Recolectar gradientes de TODOS los workers
-        all_grads = []
-        worker_losses = []
+        # Recolectar gradientes
+        all_grads, worker_losses = state.get_completed_workers_data()
         
-        for wid, worker in state.workers.items():
-            if worker.epoch_completed.is_set():
-                all_grads.append(worker.current_grads)
-                worker_losses.append(worker.current_loss)
+        if not all_grads:
+            print("ERROR: No hay gradientes para procesar")
+            break
         
-        # Verificar que tenemos todos los gradientes
-        if len(all_grads) != state.expected_workers:
-            print(f"ERROR: Solo tenemos {len(all_grads)} de {state.expected_workers} gradientes")
-            continue
-        
-        # Calcular promedio
+        # Calcular métricas
         avg_train_loss = np.mean(worker_losses)
+        
+        # Promediar gradientes
         avg_grads = average_gradients(all_grads, state.global_weights)
         
-        # ACTUALIZAR PESOS GLOBALES (solo después de que TODOS terminaron)
+        # Actualizar pesos globales
         state.global_weights = apply_gradients(
             state.global_weights, avg_grads, state.learning_rate
         )
         
-        # Evaluar
+        # Evaluar en test set
         test_loss, test_accuracy = evaluate_model(
             state.X_test, state.y_test, state.global_weights
         )
@@ -78,12 +73,21 @@ async def training_loop(state):
         
         epoch_time = time.time() - start_time
         state.epoch_times.append(epoch_time)
+
+        # Resetear workers para la siguiente época
+        for worker in state.workers.values():
+            worker.reset_for_next_epoch()
         
+        # Mostrar progreso
         if should_print:
-            print(f"✓ Train Loss: {avg_train_loss:.4f}")
-            print(f"✓ Test Loss:  {test_loss:.4f}")
-            print(f"✓ Test Accuracy:  {test_accuracy:.4f} ({test_accuracy*100:.2f}%)")
-            print(f"⏱️  Tiempo de época: {epoch_time:.2f}s")
+            print(f"Train Loss: {avg_train_loss:.4f}")
+            print(f"Test Loss:  {test_loss:.4f}")
+            print(f"Test Accuracy:  {test_accuracy:.4f} ({test_accuracy*100:.2f}%)")
+            print(f"Tiempo de época: {epoch_time:.2f}s")
+        else:
+            print(".", end="", flush=True)
+            if (epoch + 1) % 10 == 0:
+                print(f" {epoch + 1}")
         
         # Pequeña pausa para evitar saturación
         await asyncio.sleep(0.1)
@@ -91,19 +95,6 @@ async def training_loop(state):
     print(f"\n{'='*60}")
     print("ENTRENAMIENTO COMPLETADO")
     print(f"{'='*60}")
-
-def mark_worker_ready(self, worker_id: int):
-    """Marca un worker como listo para esta época."""
-    if worker_id in self.workers_ready_for_epoch:
-        self.workers_ready_for_epoch[worker_id] = True
     
-    # Verificar si todos están listos
-    if all(self.workers_ready_for_epoch.values()):
-        self.all_workers_ready.set()
-        if hasattr(self, 'current_epoch'):
-            print(f"\n🎯 ¡Todos los workers completaron la época {self.current_epoch + 1}!")
-
-def all_workers_ready_for_epoch(self) -> bool:
-    """Verifica si todos los workers están listos."""
-    return len(self.workers_ready_for_epoch) == self.expected_workers and \
-           all(self.workers_ready_for_epoch.values())
+    # Mostrar gráficas
+    plot_metrics()

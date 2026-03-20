@@ -1,24 +1,21 @@
-# communication.py
+# servidor/Communication.py
 import asyncio
 import json
 import struct
 import numpy as np
-from typing import Optional, Dict, Any
+from typing import Optional
 
 from Config import state, WorkerInfo
 
-# ==============================
-# Protocolo de comunicación
-# ==============================
 async def send_json(writer: asyncio.StreamWriter, data: dict):
-    """Envía un mensaje JSON con prefijo de longitud."""
+    """Envía datos JSON con prefijo de longitud."""
     message = json.dumps(data).encode()
     length = struct.pack(">I", len(message))
     writer.write(length + message)
     await writer.drain()
 
 async def recv_json(reader: asyncio.StreamReader) -> Optional[dict]:
-    """Recibe un mensaje JSON con prefijo de longitud."""
+    """Recibe datos JSON con prefijo de longitud."""
     try:
         raw_length = await reader.read(4)
         if not raw_length or len(raw_length) < 4:
@@ -35,29 +32,21 @@ async def recv_json(reader: asyncio.StreamReader) -> Optional[dict]:
             data += packet
         
         return json.loads(data.decode())
+    
     except Exception as e:
         print(f"[ERROR] recv_json: {e}")
         return None
 
-# ==============================
-# Manejador de workers
-# ==============================
-# servidor/communication.py
-async def handle_worker(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, 
-                        worker_id: int, dataset_chunk: np.ndarray):
-    """Maneja la comunicación con un worker."""
-    addr = writer.get_extra_info('peername')
-    print(f"\n[Worker {worker_id}] Procesando conexión desde {addr}")
-    
-    # Crear info del worker
+async def handle_worker(reader, writer, worker_id, dataset_chunk):
+    """Maneja la comunicación con un worker - VERSIÓN CORREGIDA."""
     worker_info = WorkerInfo(
-        writer=writer,
+        writer=writer, 
         reader=reader,
-        worker_id=worker_id,
+        worker_id=worker_id, 
         dataset_chunk=dataset_chunk
     )
     state.workers[worker_id] = worker_info
-    
+
     try:
         # 1. Enviar ID
         await send_json(writer, {"type": "worker_id", "worker_id": worker_id})
@@ -65,35 +54,28 @@ async def handle_worker(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         
         # 2. Enviar chunk de datos
         await send_json(writer, {
-            "type": "dataset_chunk",
+            "type": "dataset_chunk", 
             "indices": dataset_chunk.tolist()
         })
-        print(f"[Worker {worker_id}] ✓ Chunk de {len(dataset_chunk)} muestras enviado")
+        print(f"[Worker {worker_id}] ✓ Chunk enviado ({len(dataset_chunk)} muestras)")
         
-        # 3. ESPERAR a que el worker cargue sus datos y esté listo
-        # El worker enviará un mensaje "ready" cuando termine su setup
-        print(f"[Worker {worker_id}] ⏳ Esperando que el worker complete su setup...")
-        
+        # 3. IMPORTANTE: Esperar a que el worker confirme que está listo
         ready_msg = await recv_json(reader)
-        if ready_msg and ready_msg.get("type") == "worker_ready":
-            worker_info.mark_ready()
-            print(f"[Worker {worker_id}] ✓ Worker listo para entrenar")
-        else:
+        if not ready_msg or ready_msg.get("type") != "worker_ready":
             print(f"[Worker {worker_id}] ❌ No se recibió confirmación de ready")
             return
         
-        # 4. ESPERAR hasta que TODOS los workers estén listos
-        print(f"[Worker {worker_id}] ⏳ Esperando a que todos los workers estén listos...")
-        while not state.all_workers_ready_for_training():
-            await asyncio.sleep(0.5)
+        print(f"[Worker {worker_id}] ✓ Worker listo para entrenar")
+        worker_info.ready_for_training = True
         
-        print(f"[Worker {worker_id}] 🎯 ¡Todos los workers listos! Comenzando entrenamiento...")
-        
-        # 4. Bucle de épocas
+        # 4. BUCLE DE ENTRENAMIENTO: El servidor inicia cada época
         for epoch in range(state.max_epochs):
             print(f"\n[Worker {worker_id}] 📋 ÉPOCA {epoch + 1}/{state.max_epochs}")
             
-            # Enviar pesos actuales
+            # ESPERAR a que TODOS los workers estén listos para esta época
+            # (esto lo maneja el training_loop)
+            
+            # El servidor ENVÍA los pesos primero
             await send_json(writer, {
                 "type": "weights",
                 "W1": state.global_weights["W1"].tolist(),
@@ -102,18 +84,18 @@ async def handle_worker(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 "b2": state.global_weights["b2"].tolist(),
                 "epoch": epoch + 1
             })
+            print(f"[Worker {worker_id}] ✓ Pesos enviados")
             
-            # Esperar gradientes
+            # ESPERAR los gradientes del worker
             response = await recv_json(reader)
             
             if response is None or response.get("type") != "gradients":
-                print(f"[Worker {worker_id}] ❌ ERROR: Conexión perdida")
+                print(f"[Worker {worker_id}] ❌ Error: No se recibieron gradientes")
                 return
             
             # Guardar resultados
             worker_info.mark_epoch_done(response["grads"], response["loss"])
             
-            # Guardar loss del worker
             if worker_id not in state.worker_losses:
                 state.worker_losses[worker_id] = []
             state.worker_losses[worker_id].append(response["loss"])
@@ -123,12 +105,12 @@ async def handle_worker(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             # Marcar como listo para sincronización
             state.mark_worker_ready(worker_id)
             
-            # Esperar a que todos los workers terminen esta época
+            # Esperar a que TODOS los workers terminen esta época
             if not state.all_workers_ready_for_epoch():
-                print(f"[Worker {worker_id}] ⏳ Esperando a otros workers...")
+                print(f"[Worker {worker_id}] ⏳ Esperando otros workers...")
                 await state.all_workers_ready.wait()
             
-            print(f"[Worker {worker_id}] ➡️ Continuando a siguiente época...")
+            print(f"[Worker {worker_id}] ➡️ Continuando...")
         
         # 5. Fin de entrenamiento
         await send_json(writer, {
@@ -138,7 +120,7 @@ async def handle_worker(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         print(f"[Worker {worker_id}] ✓ Entrenamiento completado")
         
     except Exception as e:
-        print(f"[Worker {worker_id}] ❌ ERROR: {e}")
+        print(f"[Worker {worker_id}] ❌ Error: {e}")
         import traceback
         traceback.print_exc()
     finally:
@@ -146,4 +128,3 @@ async def handle_worker(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         await writer.wait_closed()
         if worker_id in state.workers:
             del state.workers[worker_id]
-        print(f"[Worker {worker_id}] 🔌 Conexión cerrada")
