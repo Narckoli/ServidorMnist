@@ -54,7 +54,7 @@ def plot_metrics():
     plt.tight_layout()
     filename = f"training_metrics_{time.strftime('%Y%m%d_%H%M%S')}.png"
     plt.savefig(filename, dpi=150, bbox_inches='tight')
-    print(f"\n📊 Gráficas guardadas en: {filename}")
+    print(f"\n Gráficas guardadas en: {filename}")
     plt.show()
     
     print_summary()

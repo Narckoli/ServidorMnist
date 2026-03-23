@@ -1,4 +1,4 @@
-# server.py
+# servidor/server.py
 import asyncio
 import time
 
@@ -55,70 +55,94 @@ def print_total_time():
         print(f"  Total:        {total_elapsed:.3f} segundos")
         print(f"{'='*70}")
 
-# servidor/server.py
 async def main():
     """Punto de entrada principal del servidor."""
-    # Cargar dataset
-    X_train, y_train, state.X_test, state.y_test = load_mnist_dataset()
+    server = None
     
-    # Configuración interactiva
-    await setup_configuration()
-    
-    # Inicializar pesos globales
-    state.global_weights = init_weights()
-    print("Pesos inicializados (He initialization)")
-    
-    # Preparar chunks para workers
-    dataset_chunks = stratified_split(y_train, state.expected_workers)
-    
-    # Contador de workers conectados
-    connected_count = 0
-    
-    async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-        """Manejador de conexiones de clientes."""
-        nonlocal connected_count
-        connected_count += 1
-        worker_id = connected_count
-        chunk = dataset_chunks[worker_id - 1]
+    try:
+        # Cargar dataset
+        X_train, y_train, state.X_test, state.y_test = load_mnist_dataset()
         
-        print(f"Worker {worker_id} conectado ({connected_count}/{state.expected_workers})")
-        await handle_worker(reader, writer, worker_id, chunk)
+        # Configuración interactiva
+        await setup_configuration()
         
-        # Verificar si se perdió un worker durante el entrenamiento
-        if len(state.workers) < state.expected_workers and state.current_epoch < state.max_epochs:
-            print(f"ADVERTENCIA: Worker {worker_id} desconectado durante entrenamiento")
-    
-    # Iniciar servidor
-    server = await asyncio.start_server(handle_client, state.HOST, state.PORT)
-    print(f"\nServidor iniciado en {state.HOST}:{state.PORT}")
-    print(f"Esperando {state.expected_workers} workers...")
-    
-    # Esperar a que todos se conecten
-    while connected_count < state.expected_workers:
-        await asyncio.sleep(0.1)
-    
-    print(f"\n✓ Todos los workers conectados")
-    print("⏳ Esperando que los workers completen su configuración...")
-    
-    # Esperar a que TODOS los workers envíen "worker_ready"
-    while not state.all_workers_ready_for_training():
-        await asyncio.sleep(0.5)
-    
-    print(f"\n🎯 ¡Todos los workers listos! Iniciando entrenamiento...")
-    
-    # Ejecutar entrenamiento
-    await training_loop()
-    
-    # Cerrar servidor
-    server.close()
-    await server.wait_closed()
-    
-    # Mostrar tiempo total
-    print_total_time()
-    print("\nServidor finalizado")
+        # Inicializar pesos globales
+        state.global_weights = init_weights()
+        print("Pesos inicializados (He initialization)")
+        
+        # Preparar chunks para workers
+        dataset_chunks = stratified_split(y_train, state.expected_workers)
+        
+        # Contador de workers conectados
+        connected_count = 0
+        all_workers_connected = asyncio.Event()
+        
+        async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+            nonlocal connected_count
+            connected_count += 1
+            worker_id = connected_count
+            chunk = dataset_chunks[worker_id - 1]
+            
+            print(f"✓ Worker {worker_id} conectado ({connected_count}/{state.expected_workers})")
+            
+            if connected_count == state.expected_workers:
+                print("\n ¡Todos los workers conectados!")
+                all_workers_connected.set()
+            
+            try:
+                await handle_worker(reader, writer, worker_id, chunk)
+            except Exception as e:
+                print(f"Error en worker {worker_id}: {e}")
+        
+        # Iniciar servidor
+        server = await asyncio.start_server(handle_client, state.HOST, state.PORT)
+        print(f"\n Servidor iniciado en {state.HOST}:{state.PORT}")
+        print(f" Esperando {state.expected_workers} workers...")
+        
+        # Esperar a que todos los workers se conecten
+        await all_workers_connected.wait()
+        
+        # Pequeña pausa para asegurar que todos los workers están listos
+        print(" Esperando configuración de workers...")
+        await asyncio.sleep(2)
+        
+        # Iniciar entrenamiento
+        await training_loop()
+        
+        print("✅ Entrenamiento completado exitosamente")
+        
+    except KeyboardInterrupt:
+        print("\n\n Servidor interrumpido por el usuario")
+    except Exception as e:
+        print(f"\n Error en servidor: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        print("\n=== INICIANDO LIMPIEZA DEL SERVIDOR ===")
+        
+        # Cerrar todas las conexiones de workers
+        if hasattr(state, 'worker_writers'):
+            for worker_id, writer in state.worker_writers.items():
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                    print(f"✓ Conexión con Worker {worker_id} cerrada")
+                except:
+                    pass
+        
+        # Cerrar servidor
+        if server is not None:
+            print("Cerrando servidor...")
+            server.close()
+            await server.wait_closed()
+            print("✓ Servidor cerrado correctamente")
+        
+        # Mostrar tiempo total
+        print_total_time()
+        print("\n Servidor finalizado")
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n\nServidor interrumpido por el usuario")
+        print("\n\n Servidor interrumpido por el usuario")

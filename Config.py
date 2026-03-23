@@ -1,4 +1,4 @@
-# servidor/Config.py
+# servidor/config.py
 import asyncio
 import numpy as np
 from collections import defaultdict
@@ -7,25 +7,29 @@ from typing import Dict, List, Optional, Any
 
 @dataclass
 class WorkerInfo:
-    """Información de un worker conectado."""
-    writer: asyncio.StreamWriter
-    reader: asyncio.StreamReader
-    worker_id: int
-    dataset_chunk: np.ndarray
-    current_grads: Optional[Dict[str, Any]] = None
-    current_loss: Optional[float] = None
-    epoch_completed: asyncio.Event = field(default_factory=asyncio.Event)
-    ready_for_training: bool = False  # Nuevo
+    def __init__(self, writer, reader, worker_id, dataset_chunk):
+        self.writer = writer
+        self.reader = reader
+        self.worker_id = worker_id
+        self.dataset_chunk = dataset_chunk
+        self.ready = False
+        self.gradients = None
+        self.loss = None
+        self.epoch_completed = False
     
-    def mark_epoch_done(self, grads: Dict, loss: float):
-        self.current_grads = grads
-        self.current_loss = loss
-        self.epoch_completed.set()
+    def mark_ready(self):
+        self.ready = True
+    
+    def mark_epoch_done(self, gradients, loss):
+        self.gradients = gradients
+        self.loss = loss
+        self.epoch_completed = True
     
     def reset_for_next_epoch(self):
-        self.current_grads = None
-        self.current_loss = None
-        self.epoch_completed.clear()
+        """Resetear para la siguiente época"""
+        self.gradients = None
+        self.loss = None
+        self.epoch_completed = False
 
 @dataclass
 class TrainingState:
@@ -47,8 +51,10 @@ class TrainingState:
     
     # Workers y sincronización
     workers: Dict[int, WorkerInfo] = field(default_factory=dict)
-    workers_ready_for_epoch: Dict[int, bool] = field(default_factory=dict)  # Nuevo
+    
+    # Eventos de sincronización
     all_workers_ready: asyncio.Event = field(default_factory=asyncio.Event)
+    training_started: bool = False
     
     # Métricas
     training_start_time: Optional[float] = None
@@ -59,46 +65,39 @@ class TrainingState:
     epoch_times: List[float] = field(default_factory=list)
     
     def check_all_workers_ready(self) -> bool:
-        """Verifica si todos los workers completaron la época actual."""
+        """Verifica si todos los workers han completado la época actual."""
         if len(self.workers) < self.expected_workers:
             return False
-        return all(w.epoch_completed.is_set() for w in self.workers.values())
+        return all(w.epoch_completed for w in self.workers.values())
+    
+    def check_all_workers_ready_for_training(self) -> bool:
+        """Verifica si todos los workers completaron su setup."""
+        if len(self.workers) < self.expected_workers:
+            return False
+        return all(w.ready_for_training for w in self.workers.values())
     
     def get_completed_workers_data(self) -> tuple:
         """Obtiene los datos de todos los workers que completaron."""
         all_grads = []
         worker_losses = []
         for w in self.workers.values():
-            if w.epoch_completed.is_set():
+            if w.epoch_completed:
                 all_grads.append(w.current_grads)
                 worker_losses.append(w.current_loss)
         return all_grads, worker_losses
     
     def reset_epoch_sync(self):
-        """Prepara la sincronización para una nueva época."""
+        """Resetea el estado para una nueva época."""
         self.all_workers_ready.clear()
-        self.workers_ready_for_epoch = {wid: False for wid in self.workers.keys()}
+        for worker in self.workers.values():
+            worker.reset_for_next_epoch()
     
-    def mark_worker_ready(self, worker_id: int):
-        """Marca un worker como listo para esta época."""
-        if worker_id in self.workers_ready_for_epoch:
-            self.workers_ready_for_epoch[worker_id] = True
-        
-        # Verificar si todos están listos
-        if all(self.workers_ready_for_epoch.values()):
-            print(f"\n🎯 ¡Todos los workers completaron la época {self.current_epoch + 1}!")
-            self.all_workers_ready.set()
-    
-    def all_workers_ready_for_epoch(self) -> bool:
-        """Verifica si todos los workers están listos."""
-        return len(self.workers_ready_for_epoch) == self.expected_workers and \
-               all(self.workers_ready_for_epoch.values())
-    
-    def all_workers_ready_for_training(self) -> bool:
-        """Verifica si todos los workers completaron su setup inicial."""
-        if len(self.workers) < self.expected_workers:
-            return False
-        return all(w.ready_for_training for w in self.workers.values())
+    def mark_worker_epoch_done(self, worker_id: int):
+        """Marca un worker como completado y verifica si todos están listos."""
+        if worker_id in self.workers:
+            if self.check_all_workers_ready():
+                self.all_workers_ready.set()
+                print(f"\n🎯 ¡Todos los workers completaron la época {self.current_epoch + 1}!")
 
 # Instancia global
 state = TrainingState()

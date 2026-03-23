@@ -1,5 +1,6 @@
 # Ignorar imágenes JPG
 *.jpg
+*.png
 
 # Ignorar carpeta de caché de Python
 __pycache__/
