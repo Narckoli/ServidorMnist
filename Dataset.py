@@ -24,6 +24,41 @@ def load_mnist_dataset() -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray
     print(f"✓ Dataset cargado: {X_train.shape[0]} train, {X_test.shape[0]} test")
     return X_train, y_train, X_test, y_test
 
+def load_cifar10_dataset() -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Carga CIFAR-10 usando torchvision."""
+    print("Cargando CIFAR-10 con torchvision...")
+    
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+    ])
+    
+    train_dataset = datasets.CIFAR10(
+        root='./data', train=True, download=True, transform=transform
+    )
+    test_dataset = datasets.CIFAR10(
+        root='./data', train=False, download=True, transform=transform
+    )
+    
+    # CIFAR-10: 32x32x3 = 3072 características
+    X_train = train_dataset.data.reshape(-1, 3072) / 255.0
+    y_train = np.array(train_dataset.targets)
+    X_test = test_dataset.data.reshape(-1, 3072) / 255.0
+    y_test = np.array(test_dataset.targets)
+    
+    print(f"✓ Dataset cargado: {X_train.shape[0]} train, {X_test.shape[0]} test")
+    print(f"  Dimensiones de entrada: {X_train.shape[1]} características")
+    return X_train, y_train, X_test, y_test
+
+def load_dataset_by_name(dataset_name: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Carga el dataset según el nombre especificado."""
+    if dataset_name.lower() == 'mnist':
+        return load_mnist_dataset()
+    elif dataset_name.lower() == 'cifar10' or dataset_name.lower() == 'cifar-10':
+        return load_cifar10_dataset()
+    else:
+        raise ValueError(f"Dataset '{dataset_name}' no soportado. Opciones: mnist, cifar10")
+
 def stratified_split(y: np.ndarray, n_workers: int) -> List[np.ndarray]:
     """Divide el dataset estratificadamente por clases."""
     class_indices = {label: np.where(y == label)[0] for label in range(10)}

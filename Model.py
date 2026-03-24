@@ -2,8 +2,8 @@
 import numpy as np
 from typing import Dict, List, Tuple
 
-# Dimensiones del modelo
-INPUT_SIZE = 784
+# Dimensiones del modelo (serán configuradas dinámicamente)
+INPUT_SIZE = None  # Se configurará según el dataset
 HIDDEN_SIZE = 128
 OUTPUT_SIZE = 10
 
@@ -42,8 +42,15 @@ def evaluate_model(X: np.ndarray, y: np.ndarray, weights: Dict[str, np.ndarray])
     
     return loss, accuracy
 
-def init_weights() -> Dict[str, np.ndarray]:
+def init_weights(input_size: int = None) -> Dict[str, np.ndarray]:
     """Inicializa pesos con He initialization."""
+    global INPUT_SIZE
+    if input_size is not None:
+        INPUT_SIZE = input_size
+    
+    if INPUT_SIZE is None:
+        raise ValueError("INPUT_SIZE no está configurado. Debe especificarse al inicializar los pesos.")
+    
     W1 = np.random.randn(INPUT_SIZE, HIDDEN_SIZE) * np.sqrt(2.0 / INPUT_SIZE)
     W2 = np.random.randn(HIDDEN_SIZE, OUTPUT_SIZE) * np.sqrt(2.0 / HIDDEN_SIZE)
     

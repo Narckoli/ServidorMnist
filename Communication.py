@@ -5,7 +5,7 @@ import struct
 import numpy as np
 from typing import Optional
 
-from Config import state, WorkerInfo
+from Config import state 
 
 async def send_json(writer: asyncio.StreamWriter, data: dict):
     """Envía un mensaje JSON con prefijo de longitud."""
@@ -42,111 +42,93 @@ async def handle_worker(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
     addr = writer.get_extra_info('peername')
     print(f"\n[Worker {worker_id}] Conectado desde {addr}")
     
-    # REGISTRAR EL WRITER EN worker_writers
-    state.worker_writers[worker_id] = writer  # <--- AGREGAR ESTO
-    
-    # Crear info del worker
-    worker_info = WorkerInfo(
-        writer=writer,
-        reader=reader,
-        worker_id=worker_id,
-        dataset_chunk=dataset_chunk
-    )
-    state.workers[worker_id] = worker_info
+    # Registrar el worker
+    state.worker_writers[worker_id] = writer
+    state.worker_readers[worker_id] = reader
+    state.worker_chunks[worker_id] = dataset_chunk
     
     try:
         # 1. Enviar ID
         await send_json(writer, {"type": "worker_id", "worker_id": worker_id})
         print(f"[Worker {worker_id}] ✓ ID enviado")
         
-        # 2. Enviar chunk de datos
+        # 2. Enviar información del dataset
+        await send_json(writer, {
+            "type": "dataset_info",
+            "dataset_name": state.dataset_name,
+            "input_size": state.input_size
+        })
+        print(f"[Worker {worker_id}] ✓ Dataset info enviada: {state.dataset_name} ({state.input_size} features)")
+        
+        # 3. Enviar chunk de datos
         await send_json(writer, {
             "type": "dataset_chunk",
             "indices": dataset_chunk.tolist()
         })
         print(f"[Worker {worker_id}] ✓ Chunk enviado ({len(dataset_chunk)} muestras)")
         
-        # 3. Esperar confirmación de READY
+        # 4. Esperar confirmación de READY
         ready_msg = await recv_json(reader)
         if ready_msg and ready_msg.get("type") == "worker_ready":
-            worker_info.mark_ready()
-            print(f"[Worker {worker_id}]  Worker listo para entrenar")
+            state.mark_worker_ready(worker_id)
+            print(f"[Worker {worker_id}] ✓ Worker listo para entrenar")
         else:
-            print(f"[Worker {worker_id}]  No se recibió confirmación de ready")
+            print(f"[Worker {worker_id}] ✗ No se recibió confirmación de ready")
             return
         
-        # 4. Esperar a que TODOS los workers estén listos
-        print(f"[Worker {worker_id}]  Esperando a que todos los workers estén listos...")
-        while not state.check_all_workers_ready_for_training():
-            await asyncio.sleep(0.5)
-        
-        # 5. Bucle de épocas - AHORA SINCRONIZADO
-        for epoch in range(state.max_epochs):
-            # Verificar si estamos en la época correcta
-            while state.current_epoch != epoch:
-                await asyncio.sleep(0.1)
+        # 5. Bucle principal de comunicación - MANEJA TODOS LOS MENSAJES AQUÍ
+        while True:
+            # Esperar mensaje del worker
+            msg = await recv_json(reader)
             
-            print(f"\n[Worker {worker_id}]  ÉPOCA {epoch + 1}/{state.max_epochs}")
+            if msg is None:
+                print(f"[Worker {worker_id}] Conexión perdida")
+                break
             
-            # Enviar pesos actuales
-            await send_json(writer, {
-                "type": "weights",
-                "W1": state.global_weights["W1"].tolist(),
-                "b1": state.global_weights["b1"].tolist(),
-                "W2": state.global_weights["W2"].tolist(),
-                "b2": state.global_weights["b2"].tolist(),
-                "epoch": epoch + 1
-            })
+            msg_type = msg.get("type")
             
-            # Esperar gradientes
-            response = await recv_json(reader)
-            
-            if response is None or response.get("type") != "gradients":
-                print(f"[Worker {worker_id}]  ERROR: Conexión perdida")
-                return
-            
-            # Guardar resultados
-            worker_info.mark_epoch_done(response["grads"], response["loss"])
-            
-            # Guardar loss del worker
-            if worker_id not in state.worker_losses:
-                state.worker_losses[worker_id] = []
-            state.worker_losses[worker_id].append(response["loss"])
-            
-            print(f"[Worker {worker_id}]  Loss recibida: {response['loss']:.4f}")
-            
-            # Notificar al coordinador
-            if state.check_all_workers_ready():
-                state.all_workers_ready.set()
-            
-            # Esperar a que el coordinador procese esta época
-            await state.all_workers_ready.wait()
-            
-            # Pequeña pausa antes de la siguiente época
-            await asyncio.sleep(0.4)
-            
-        # 6. Fin de entrenamiento
-        await send_json(writer, {
-            "type": "training_complete",
-            "message": "Entrenamiento finalizado"
-        })
-        print(f"[Worker {worker_id}]  Entrenamiento completado")
+            if msg_type == "gradients":
+                # Recibir gradientes del worker
+                grads = {
+                    "W1": np.array(msg["grads"]["W1"]),
+                    "b1": np.array(msg["grads"]["b1"]),
+                    "W2": np.array(msg["grads"]["W2"]),
+                    "b2": np.array(msg["grads"]["b2"])
+                }
+                loss = msg.get("loss", 0.0)
+                epoch = msg.get("epoch", 0)
+                
+                print(f"[Worker {worker_id}] Gradientes recibidos (época {epoch}, loss: {loss:.4f})")
+                
+                # Guardar gradientes para el entrenamiento
+                state.worker_gradients[worker_id] = grads
+                state.worker_losses[worker_id] = loss
+                
+                # Verificar si todos los workers han enviado sus gradientes
+                if len(state.worker_gradients) == len(state.worker_writers):
+                    print(f"[Training] Todos los gradientes recibidos para época {epoch}")
+                    state.all_workers_ready.set()
+                
+            elif msg_type == "training_complete":
+                print(f"[Worker {worker_id}] Entrenamiento completado")
+                break
+                
+            else:
+                print(f"[Worker {worker_id}] Mensaje desconocido: {msg_type}")
         
     except Exception as e:
-        print(f"[Worker {worker_id}]  ERROR: {e}")
+        print(f"[Worker {worker_id}] ERROR: {e}")
         import traceback
         traceback.print_exc()
     finally:
-        # LIMPIAR AMBOS DICCIONARIOS
-        if worker_id in state.worker_writers:
-            del state.worker_writers[worker_id]
-        if worker_id in state.workers:
-            del state.workers[worker_id]
+        # Eliminar worker de los diccionarios de manera segura
+        async with state.lock:
+            state.worker_writers.pop(worker_id, None)
+            state.worker_readers.pop(worker_id, None)
         
         try:
             writer.close()
             await writer.wait_closed()
+            print(f"[Worker {worker_id}] Conexión cerrada")
         except:
             pass
-            
-        print(f"[Worker {worker_id}]  Conexión cerrada")

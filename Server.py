@@ -3,13 +3,32 @@ import asyncio
 import time
 
 from Config import state
-from Dataset import load_mnist_dataset, stratified_split
+from Dataset import load_dataset_by_name, stratified_split
 from Model import init_weights
 from Communication import handle_worker
 from Training import training_loop
 
 async def setup_configuration():
     """Configuración interactiva del entrenamiento."""
+    # Selección del dataset
+    print("\n=== SELECCIÓN DE DATASET ===")
+    print("1. MNIST (28x28 imágenes, 784 características)")
+    print("2. CIFAR-10 (32x32x3 imágenes, 3072 características)")
+    
+    while True:
+        try:
+            choice = input("\nSelecciona el dataset (1 o 2): ").strip()
+            if choice == '1':
+                state.dataset_name = 'mnist'
+                break
+            elif choice == '2':
+                state.dataset_name = 'cifar10'
+                break
+            else:
+                print("Opción no válida. Por favor selecciona 1 o 2.")
+        except:
+            pass
+    
     # Número de workers
     while True:
         try:
@@ -36,7 +55,7 @@ async def setup_configuration():
     except:
         pass
     
-    print(f"\nConfiguración: {state.expected_workers} workers, {state.max_epochs} épocas, lr={state.learning_rate}")
+    print(f"\nConfiguración: Dataset={state.dataset_name.upper()}, {state.expected_workers} workers, {state.max_epochs} épocas, lr={state.learning_rate}")
 
 def print_total_time():
     """Muestra el tiempo total de entrenamiento."""
@@ -60,15 +79,18 @@ async def main():
     server = None
     
     try:
-        # Cargar dataset
-        X_train, y_train, state.X_test, state.y_test = load_mnist_dataset()
-        
         # Configuración interactiva
         await setup_configuration()
         
-        # Inicializar pesos globales
-        state.global_weights = init_weights()
-        print("Pesos inicializados (He initialization)")
+        # Cargar dataset seleccionado
+        X_train, y_train, state.X_test, state.y_test = load_dataset_by_name(state.dataset_name)
+        
+        # Configurar input size en el modelo
+        state.input_size = X_train.shape[1]
+        
+        # Inicializar pesos globales con el input size correcto
+        state.global_weights = init_weights(input_size=state.input_size)
+        print(f"Pesos inicializados (He initialization) para {state.input_size} características de entrada")
         
         # Preparar chunks para workers
         dataset_chunks = stratified_split(y_train, state.expected_workers)
@@ -93,6 +115,11 @@ async def main():
                 await handle_worker(reader, writer, worker_id, chunk)
             except Exception as e:
                 print(f"Error en worker {worker_id}: {e}")
+            finally:
+                # Asegurarse de que el worker se elimina del diccionario cuando se desconecta
+                async with state.lock:
+                    state.worker_writers.pop(worker_id, None)
+                    state.worker_readers.pop(worker_id, None)
         
         # Iniciar servidor
         server = await asyncio.start_server(handle_client, state.HOST, state.PORT)
@@ -120,15 +147,24 @@ async def main():
     finally:
         print("\n=== INICIANDO LIMPIEZA DEL SERVIDOR ===")
         
-        # Cerrar todas las conexiones de workers
-        if hasattr(state, 'worker_writers'):
-            for worker_id, writer in state.worker_writers.items():
-                try:
-                    writer.close()
-                    await writer.wait_closed()
-                    print(f"✓ Conexión con Worker {worker_id} cerrada")
-                except:
-                    pass
+        # Cerrar todas las conexiones de workers - USAR COPIA DEL DICCIONARIO
+        # Para evitar el error de modificación durante iteración, hacemos una copia
+        workers_to_close = []
+        async with state.lock:
+            workers_to_close = list(state.worker_writers.items())
+        
+        for worker_id, writer in workers_to_close:
+            try:
+                writer.close()
+                await writer.wait_closed()
+                print(f"✓ Conexión con Worker {worker_id} cerrada")
+            except Exception as e:
+                print(f"Error cerrando Worker {worker_id}: {e}")
+        
+        # Limpiar diccionarios después de cerrar conexiones
+        async with state.lock:
+            state.worker_writers.clear()
+            state.worker_readers.clear()
         
         # Cerrar servidor
         if server is not None:

@@ -1,116 +1,154 @@
-# servidor/Training.py
+# training.py
 import asyncio
 import time
 import numpy as np
-
 from Config import state
-from Model import evaluate_model, average_gradients, apply_gradients
-from Metrics import plot_metrics
+from Model import average_gradients, apply_gradients, evaluate_model
 
 async def training_loop():
-    """Loop principal de entrenamiento - VERSIÓN CORREGIDA."""
-    state.training_start_time = time.time()
-    print_interval = 50
-    
-    print(f"\n{'='*60}")
+    """Bucle principal de entrenamiento."""
+    print("\n" + "="*70)
     print("INICIO DE ENTRENAMIENTO")
-    print(f"{'='*60}")
+    print("="*70)
     
-    # PRIMERO: Esperar a que TODOS los workers estén listos para entrenar
+    # Inicializar estructuras para sincronización (protegidas por lock)
+    async with state.lock:
+        state.worker_gradients = {}
+        state.worker_losses = {}
+        state.all_workers_ready = asyncio.Event()
+        state.current_epoch = 0
+        state.training_start_time = time.time()
+        state.epoch_events = {}
+    
     print(" Esperando que todos los workers completen su setup...")
-    while not state.check_all_workers_ready_for_training():
-        await asyncio.sleep(0.5)
-    print("✓ Todos los workers listos!")
     
-    try:
-        for epoch in range(state.max_epochs):
-            start_time = time.time()
+    # Esperar a que todos los workers estén listos
+    while True:
+        async with state.lock:
+            workers_ready = state.check_all_workers_ready_for_training()
+        if workers_ready:
+            break
+        await asyncio.sleep(0.5)
+    
+    print("✓ Todos los workers están listos!\n")
+    
+    # Evaluación inicial
+    print("Evaluación inicial del modelo global:")
+    initial_loss, initial_acc = evaluate_model(state.X_test, state.y_test, state.global_weights)
+    print(f"  Loss: {initial_loss:.4f}, Accuracy: {initial_acc:.4f}\n")
+    
+    for epoch in range(state.max_epochs):
+        async with state.lock:
             state.current_epoch = epoch
+        print("="*70)
+        print(f"ÉPOCA {epoch + 1}/{state.max_epochs}")
+        print("="*70)
+        
+        async with state.lock:
+            state.epoch_start_time = time.time()
+        
+        # Limpiar estructuras de la época anterior (protegido por lock)
+        async with state.lock:
+            state.worker_gradients.clear()
+            state.worker_losses.clear()
+            state.all_workers_ready.clear()
             
-            # Resetear sincronización para esta época
-            state.reset_epoch_sync()
+            # Crear evento para esta época
+            epoch_event = asyncio.Event()
+            state.epoch_events[epoch] = epoch_event
+        
+        # Enviar pesos a todos los workers - HACER COPIA DEL DICCIONARIO
+        print(f"\n[Época {epoch + 1}] Enviando pesos a los workers...")
+        
+        # Obtener copia de los writers para evitar modificación durante iteración
+        async with state.lock:
+            workers_to_send = list(state.worker_writers.items())
+        
+        for worker_id, writer in workers_to_send:
+            try:
+                await send_weights_to_worker(writer, state.global_weights, epoch + 1)
+                print(f"   Pesos enviados al Worker {worker_id}")
+            except Exception as e:
+                print(f"   Error con Worker {worker_id}: {e}")
+        
+        # Esperar a que todos los workers envíen sus gradientes
+        print(f"\n[Época {epoch + 1}] Esperando gradientes de los workers...")
+        
+        try:
+            # Esperar hasta que todos los workers hayan respondido
+            async with state.lock:
+                ready_event = state.all_workers_ready
+            await asyncio.wait_for(ready_event.wait(), timeout=60.0)
             
-            should_print = (epoch + 1) % print_interval == 0 or epoch == 0 or epoch == state.max_epochs - 1
+            # Promediar gradientes - OBTENER COPIA DE LOS GRADIENTES
+            print("\n[Época {}] Promediando gradientes...".format(epoch + 1))
             
-            if should_print:
-                print(f"\n{'='*60}")
-                print(f'ÉPOCA {epoch + 1}/{state.max_epochs}')
-                print(f"{'='*60}")
-                print("Esperando gradientes de todos los workers...")
+            async with state.lock:
+                gradients_list = list(state.worker_gradients.values())
+                losses_list = list(state.worker_losses.values())
             
-            # Esperar a que todos los workers completen
-            await state.all_workers_ready.wait()
+            avg_gradients = average_gradients(gradients_list, state.global_weights)
             
-            # Recolectar gradientes
-            all_grads, worker_losses = state.get_completed_workers_data()
-            
-            if not all_grads:
-                print("ERROR: No hay gradientes para procesar")
-                break
-            
-            # Calcular métricas
-            avg_train_loss = np.mean(worker_losses)
-            
-            # Promediar gradientes
-            avg_grads = average_gradients(all_grads, state.global_weights)
-            
-            # Actualizar pesos globales
+            # Aplicar gradientes
             state.global_weights = apply_gradients(
-                state.global_weights, avg_grads, state.learning_rate
+                state.global_weights,
+                avg_gradients,
+                state.learning_rate
             )
             
-            # Evaluar en test set
-            test_loss, test_accuracy = evaluate_model(
+            # Calcular pérdida promedio
+            avg_loss = np.mean(losses_list)
+            
+            # Evaluar modelo
+            test_loss, test_acc = evaluate_model(
                 state.X_test, state.y_test, state.global_weights
             )
             
-            # Guardar métricas
-            state.train_losses.append(avg_train_loss)
-            state.test_losses.append(test_loss)
-            state.test_accuracies.append(test_accuracy)
+            # Mostrar resultados
+            async with state.lock:
+                epoch_time = time.time() - state.epoch_start_time
             
-            epoch_time = time.time() - start_time
-            state.epoch_times.append(epoch_time)
+            print(f"\n RESULTADOS ÉPOCA {epoch + 1}:")
+            print(f"  Pérdida promedio (workers): {avg_loss:.4f}")
+            print(f"  Pérdida (test): {test_loss:.4f}")
+            print(f"  Accuracy (test): {test_acc:.4f}")
+            print(f"  Tiempo: {epoch_time:.2f} segundos")
             
-            # Resetear workers para la siguiente época
-            for worker in state.workers.values():
-                worker.reset_for_next_epoch()
+        except asyncio.TimeoutError:
+            print(f" Timeout: No se recibieron gradientes de todos los workers")
+            async with state.lock:
+                received = len(state.worker_gradients)
+                expected = len(state.worker_writers)
+            print(f"  Workers que respondieron: {received}/{expected}")
+            break
             
-            # Mostrar progreso
-            if should_print:
-                print(f"Train Loss: {avg_train_loss:.4f}")
-                print(f"Test Loss:  {test_loss:.4f}")
-                print(f"Test Accuracy:  {test_accuracy:.4f} ({test_accuracy*100:.2f}%)")
-                print(f"Tiempo de época: {epoch_time:.2f}s")
-            else:
-                print(".", end="", flush=True)
-                if (epoch + 1) % 10 == 0:
-                    print(f" {epoch + 1}")
-            
-            # Pequeña pausa para evitar saturación
-            await asyncio.sleep(0.1)
-    
-    finally:
-        # IMPORTANTE: Notificar a todos los workers que terminen
-        print(f"\n{'='*60}")
-        print("NOTIFICANDO TERMINACIÓN A WORKERS...")
-        print(f"{'='*60}")
+        except Exception as e:
+            print(f" Error en época {epoch + 1}: {e}")
+            import traceback
+            traceback.print_exc()
+            break
         
-        # Enviar señal de terminación a cada worker
-        for worker_id, writer in state.worker_writers.items():
-            try:
-                writer.write(b"TERMINATE\n")
-                await writer.drain()
-                print(f" Señal de terminación enviada a Worker {worker_id}")
-            except Exception as e:
-                print(f" Error al enviar terminación a Worker {worker_id}: {e}")
-        
-        # Dar tiempo a los workers para cerrar
-        await asyncio.sleep(1)
+        print()
     
-    print(f"\n{'='*60}")
+    # Evaluación final
+    print("\n" + "="*70)
     print("ENTRENAMIENTO COMPLETADO")
-    print(f"{'='*60}")
+    print("="*70)
+    final_loss, final_acc = evaluate_model(state.X_test, state.y_test, state.global_weights)
+    print(f"Modelo final - Loss: {final_loss:.4f}, Accuracy: {final_acc:.4f}")
     
-    # Mostrar gráficas
-    plot_metrics()
+    total_time = time.time() - state.training_start_time
+    print(f"Tiempo total: {total_time:.2f} segundos")
+    print("="*70)
+
+async def send_weights_to_worker(writer, weights, epoch):
+    """Envía pesos a un worker usando JSON."""
+    from Communication import send_json
+    await send_json(writer, {
+        "type": "weights",
+        "W1": weights["W1"].tolist(),
+        "b1": weights["b1"].tolist(),
+        "W2": weights["W2"].tolist(),
+        "b2": weights["b2"].tolist(),
+        "epoch": epoch
+    })
