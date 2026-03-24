@@ -136,7 +136,7 @@ async def main():
         # Iniciar entrenamiento
         await training_loop()
         
-        print("✅ Entrenamiento completado exitosamente")
+        print(" Entrenamiento completado exitosamente")
         
     except KeyboardInterrupt:
         print("\n\n Servidor interrumpido por el usuario")

@@ -4,6 +4,7 @@ import time
 import numpy as np
 from Config import state
 from Model import average_gradients, apply_gradients, evaluate_model
+from Export_Metrics import save_final_summary  
 
 async def training_loop():
     """Bucle principal de entrenamiento."""
@@ -11,7 +12,7 @@ async def training_loop():
     print("INICIO DE ENTRENAMIENTO")
     print("="*70)
     
-    # Inicializar estructuras para sincronización (protegidas por lock)
+    # Inicializar estructuras para sincronización
     async with state.lock:
         state.worker_gradients = {}
         state.worker_losses = {}
@@ -47,20 +48,18 @@ async def training_loop():
         async with state.lock:
             state.epoch_start_time = time.time()
         
-        # Limpiar estructuras de la época anterior (protegido por lock)
+        # Limpiar estructuras de la época
         async with state.lock:
             state.worker_gradients.clear()
             state.worker_losses.clear()
             state.all_workers_ready.clear()
             
-            # Crear evento para esta época
             epoch_event = asyncio.Event()
             state.epoch_events[epoch] = epoch_event
         
-        # Enviar pesos a todos los workers - HACER COPIA DEL DICCIONARIO
+        # Enviar pesos a todos los workers
         print(f"\n[Época {epoch + 1}] Enviando pesos a los workers...")
         
-        # Obtener copia de los writers para evitar modificación durante iteración
         async with state.lock:
             workers_to_send = list(state.worker_writers.items())
         
@@ -71,21 +70,19 @@ async def training_loop():
             except Exception as e:
                 print(f"   Error con Worker {worker_id}: {e}")
         
-        # Esperar a que todos los workers envíen sus gradientes
         print(f"\n[Época {epoch + 1}] Esperando gradientes de los workers...")
         
         try:
-            # Esperar hasta que todos los workers hayan respondido
             async with state.lock:
                 ready_event = state.all_workers_ready
             await asyncio.wait_for(ready_event.wait(), timeout=60.0)
             
-            # Promediar gradientes - OBTENER COPIA DE LOS GRADIENTES
             print("\n[Época {}] Promediando gradientes...".format(epoch + 1))
             
             async with state.lock:
                 gradients_list = list(state.worker_gradients.values())
                 losses_list = list(state.worker_losses.values())
+                worker_losses_dict = dict(state.worker_losses)  # Copiar pérdidas por worker
             
             avg_gradients = average_gradients(gradients_list, state.global_weights)
             
@@ -104,7 +101,7 @@ async def training_loop():
                 state.X_test, state.y_test, state.global_weights
             )
             
-            # Mostrar resultados
+            # Calcular tiempo de época
             async with state.lock:
                 epoch_time = time.time() - state.epoch_start_time
             
@@ -140,6 +137,10 @@ async def training_loop():
     total_time = time.time() - state.training_start_time
     print(f"Tiempo total: {total_time:.2f} segundos")
     print("="*70)
+    
+    # ========== GUARDAR RESUMEN FINAL ==========
+    save_final_summary(final_loss, final_acc, total_time)
+    # ===========================================
 
 async def send_weights_to_worker(writer, weights, epoch):
     """Envía pesos a un worker usando JSON."""

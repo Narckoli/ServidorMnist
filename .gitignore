@@ -11,3 +11,6 @@ data/
 
 # Ignorar archivos temporales
 *.log
+
+#Ingorar archivos CSV
+*.CSV
