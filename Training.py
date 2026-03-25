@@ -75,7 +75,7 @@ async def training_loop():
         try:
             async with state.lock:
                 ready_event = state.all_workers_ready
-            await asyncio.wait_for(ready_event.wait(), timeout=60.0)
+            await asyncio.wait_for(ready_event.wait(), timeout=180.0)
             
             print("\n[Época {}] Promediando gradientes...".format(epoch + 1))
             
