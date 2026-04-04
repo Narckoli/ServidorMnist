@@ -1,4 +1,4 @@
-# config.py
+# Config.py - Servidor
 import asyncio
 import time
 from typing import Dict, List, Optional
@@ -7,67 +7,76 @@ import numpy as np
 class State:
     """Estado global del servidor."""
     def __init__(self):
-        self.HOST = '0.0.0.0'  
+        self.HOST = '0.0.0.0'
         self.PORT = 5000
-        
-        # Configuración del dataset
+
+        # Modelo y dataset
+        self.model_type   = None   # 'mlp' | 'cnn'
+        self.model        = None   # instancia ModelCNN (sólo modo cnn)
         self.dataset_name = None
-        self.input_size = None
-        
-        # Configuración del entrenamiento
+        self.input_size   = None
+
+        # Hiperparámetros
         self.expected_workers = 0
-        self.max_epochs = 10
-        self.learning_rate = 0.1
-        
+        self.max_epochs       = 10
+        self.learning_rate    = 0.01
+
         # Estado del entrenamiento
         self.global_weights = None
         self.X_test = None
         self.y_test = None
-        
-        # Conexiones de workers
+
+        # Conexiones
         self.worker_writers: Dict[int, asyncio.StreamWriter] = {}
         self.worker_readers: Dict[int, asyncio.StreamReader] = {}
-        
-        # Datos de entrenamiento
-        self.worker_chunks: Dict[int, np.ndarray] = {}
-        self.worker_ready: Dict[int, bool] = {}  # Nuevo: estado de preparación de workers
-        self.worker_gradients: Dict[int, Dict] = {}
-        self.worker_losses: Dict[int, float] = {}
-        
-        # Estado de preparación de workers
-        self.workers_ready: Dict[int, bool] = {}  # Para trackear si cada worker está listo
-        
-        # Control de entrenamiento
-        self.training_active = True
-        self.current_epoch = 0
-        self.training_start_time = None
-        self.epoch_start_time = None
-        
-        # Lock para operaciones concurrentes
+
+        # Datos por worker
+        self.worker_chunks:    Dict[int, np.ndarray] = {}
+        self.worker_ready:     Dict[int, bool]       = {}
+        self.worker_gradients: Dict[int, Dict]       = {}
+
+        # loss escalar de la última época (para promediar en Training)
+        self.worker_losses:    Dict[int, float]      = {}
+
+        # historial de losses por worker a lo largo de todas las épocas
+        # usado por Metrics.py para la gráfica "Loss Individual por Worker"
+        self.worker_loss_history: Dict[int, List[float]] = {}
+
+        # Preparación de workers
+        self.workers_ready: Dict[int, bool] = {}
+
+        # Métricas globales
+        self.train_losses:    List[float] = []
+        self.test_losses:     List[float] = []
+        self.test_accuracies: List[float] = []
+        self.epoch_times:     List[float] = []
+
+        # Control
+        self.training_active      = True
+        self.current_epoch        = 0
+        self.training_start_time  = None
+        self.epoch_start_time     = None
+
+        # Sincronización
+        self.all_workers_ready = None          # asyncio.Event, creado en training_loop
+        self.epoch_events: Dict[int, asyncio.Event] = {}
         self.lock = asyncio.Lock()
-    
+
+    # ── helpers ────────────────────────────────────────────────────────────────
+
     def check_all_workers_ready_for_training(self) -> bool:
-        """Verifica si todos los workers están listos para entrenar."""
-        # Si no hay workers configurados, retornar False
         if not self.worker_writers:
             return False
-        
-        # Verificar que todos los workers estén marcados como ready
-        # Si workers_ready está vacío, asumimos que no están listos
-        if len(self.workers_ready) == 0:
-            return False
-            
-        # Verificar que todos los workers esperados estén ready
-        for worker_id in range(1, self.expected_workers + 1):
-            if not self.workers_ready.get(worker_id, False):
+        for wid in range(1, self.expected_workers + 1):
+            if not self.workers_ready.get(wid, False):
                 return False
-        
         return True
-    
+
     def mark_worker_ready(self, worker_id: int):
-        """Marca un worker como listo para entrenar."""
         self.workers_ready[worker_id] = True
+        # Inicializar historial de losses para este worker
+        if worker_id not in self.worker_loss_history:
+            self.worker_loss_history[worker_id] = []
         print(f"[Config] Worker {worker_id} marcado como listo")
-    
 
 state = State()

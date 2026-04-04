@@ -1,134 +1,150 @@
-# servidor/communication.py
-import asyncio
+# Communication.py - Servidor
+# Protocolo: JSON con delimitador \n en AMBOS sentidos (servidor y worker)
 import json
+import asyncio
 import struct
 import numpy as np
-from typing import Optional
+from Config import state
 
-from Config import state 
+# ─────────────────────────────────────────────
+# Primitivas de bajo nivel
+# ─────────────────────────────────────────────
 
-async def send_json(writer: asyncio.StreamWriter, data: dict):
-    """Envía un mensaje JSON con prefijo de longitud."""
-    message = json.dumps(data).encode()
-    length = struct.pack(">I", len(message))
-    writer.write(length + message)
+async def send_json(writer, data: dict):
+    """Envía un dict como JSON terminado en \\n."""
+    line = json.dumps(data) + '\n'
+    writer.write(line.encode())
     await writer.drain()
 
-async def recv_json(reader: asyncio.StreamReader) -> Optional[dict]:
-    """Recibe un mensaje JSON con prefijo de longitud."""
+async def recv_json(reader) -> dict | None:
+    """Lee una línea y la deserializa como JSON. Retorna None si la conexión se cerró."""
     try:
-        raw_length = await reader.read(4)
-        if not raw_length or len(raw_length) < 4:
+        line = await reader.readline()
+        if not line:
             return None
-        
-        message_length = struct.unpack(">I", raw_length)[0]
-        
-        data = b""
-        while len(data) < message_length:
-            chunk_size = min(8192, message_length - len(data))
-            packet = await reader.read(chunk_size)
-            if not packet:
-                return None
-            data += packet
-        
-        return json.loads(data.decode())
-    except Exception as e:
-        print(f"[ERROR] recv_json: {e}")
+        return json.loads(line.decode())
+    except (json.JSONDecodeError, asyncio.IncompleteReadError):
         return None
 
-async def handle_worker(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, 
-                        worker_id: int, dataset_chunk: np.ndarray):
-    """Maneja la comunicación con un worker."""
-    addr = writer.get_extra_info('peername')
-    print(f"\n[Worker {worker_id}] Conectado desde {addr}")
-    
-    # Registrar el worker
-    state.worker_writers[worker_id] = writer
-    state.worker_readers[worker_id] = reader
-    state.worker_chunks[worker_id] = dataset_chunk
-    
+# ─────────────────────────────────────────────
+# Mensajes de setup
+# ─────────────────────────────────────────────
+
+async def send_worker_id(writer, worker_id: int):
+    """Paso 1: envía el ID al worker."""
+    await send_json(writer, {"type": "id", "worker_id": worker_id})
+
+async def send_dataset_info(writer, dataset_name: str, input_size: int, model_type: str):
+    """Paso 2: envía metadatos del dataset y modelo."""
+    await send_json(writer, {
+        "type": "dataset_info",
+        "dataset": dataset_name,          # worker lee msg["dataset"]
+        "input_size": input_size,
+        "model_type": model_type,
+    })
+
+async def send_chunk_indices(writer, chunk: np.ndarray):
+    """
+    Paso 3: envía los índices del chunk como JSON (lista de ints).
+    Evitamos el protocolo binario para mantener un único protocolo en toda la sesión.
+    """
+    await send_json(writer, {
+        "type": "chunk",
+        "indices": chunk.tolist(),
+    })
+
+# ─────────────────────────────────────────────
+# Handler principal de cada worker
+# ─────────────────────────────────────────────
+
+async def handle_worker(reader, writer, worker_id: int, chunk: np.ndarray):
+    """
+    Gestiona el ciclo completo de un worker:
+      setup (3 pasos) → esperar "ready" → bucle de entrenamiento.
+    """
     try:
-        # 1. Enviar ID
-        await send_json(writer, {"type": "worker_id", "worker_id": worker_id})
+        # ── Registrar conexión ──────────────────────────────────────
+        async with state.lock:
+            state.worker_readers[worker_id] = reader
+            state.worker_writers[worker_id] = writer
+            state.worker_chunks[worker_id]  = chunk
+
+        # ── Paso 1: ID ──────────────────────────────────────────────
+        await send_worker_id(writer, worker_id)
         print(f"[Worker {worker_id}] ✓ ID enviado")
-        
-        # 2. Enviar información del dataset
-        await send_json(writer, {
-            "type": "dataset_info",
-            "dataset_name": state.dataset_name,
-            "input_size": state.input_size
-        })
-        print(f"[Worker {worker_id}] ✓ Dataset info enviada: {state.dataset_name} ({state.input_size} features)")
-        
-        # 3. Enviar chunk de datos
-        await send_json(writer, {
-            "type": "dataset_chunk",
-            "indices": dataset_chunk.tolist()
-        })
-        print(f"[Worker {worker_id}] ✓ Chunk enviado ({len(dataset_chunk)} muestras)")
-        
-        # 4. Esperar confirmación de READY
-        ready_msg = await recv_json(reader)
-        if ready_msg and ready_msg.get("type") == "worker_ready":
-            state.mark_worker_ready(worker_id)
-            print(f"[Worker {worker_id}] ✓ Worker listo para entrenar")
+
+        # ── Paso 2: Dataset info ────────────────────────────────────
+        await send_dataset_info(writer, state.dataset_name,
+                                state.input_size, state.model_type)
+        print(f"[Worker {worker_id}] ✓ Dataset info enviada")
+
+        # ── Paso 3: Chunk de índices ────────────────────────────────
+        await send_chunk_indices(writer, chunk)
+        print(f"[Worker {worker_id}] ✓ Chunk enviado ({len(chunk)} muestras)")
+
+        # ── Esperar "ready" del worker ──────────────────────────────
+        msg = await recv_json(reader)
+        if msg and msg.get("type") == "ready":
+            async with state.lock:
+                state.mark_worker_ready(worker_id)
+            print(f"[Worker {worker_id}] ✓ Listo para entrenar")
         else:
-            print(f"[Worker {worker_id}] ✗ No se recibió confirmación de ready")
+            print(f"[Worker {worker_id}] ✗ Respuesta inesperada en setup: {msg}")
             return
-        
-        # 5. Bucle principal de comunicación - MANEJA TODOS LOS MENSAJES AQUÍ
-        while True:
-            # Esperar mensaje del worker
-            msg = await recv_json(reader)
-            
-            if msg is None:
-                print(f"[Worker {worker_id}] Conexión perdida")
-                break
-            
-            msg_type = msg.get("type")
-            
-            if msg_type == "gradients":
-                # Recibir gradientes del worker
-                grads = {
-                    "W1": np.array(msg["grads"]["W1"]),
-                    "b1": np.array(msg["grads"]["b1"]),
-                    "W2": np.array(msg["grads"]["W2"]),
-                    "b2": np.array(msg["grads"]["b2"])
-                }
-                loss = msg.get("loss", 0.0)
-                epoch = msg.get("epoch", 0)
-                
-                print(f"[Worker {worker_id}] Gradientes recibidos (época {epoch}, loss: {loss:.4f})")
-                
-                # Guardar gradientes para el entrenamiento
-                state.worker_gradients[worker_id] = grads
-                state.worker_losses[worker_id] = loss
-                
-                # Verificar si todos los workers han enviado sus gradientes
-                if len(state.worker_gradients) == len(state.worker_writers):
-                    print(f"[Training] Todos los gradientes recibidos para época {epoch}")
-                    state.all_workers_ready.set()
-                
-            elif msg_type == "training_complete":
-                print(f"[Worker {worker_id}] Entrenamiento completado")
-                break
-                
-            else:
-                print(f"[Worker {worker_id}] Mensaje desconocido: {msg_type}")
-        
+
+        # ── Bucle de entrenamiento ──────────────────────────────────
+        while state.training_active:
+            try:
+                msg = await asyncio.wait_for(recv_json(reader), timeout=300.0)
+                if msg is None:
+                    print(f"[Worker {worker_id}] Conexión cerrada")
+                    break
+
+                mtype = msg.get("type")
+
+                if mtype == "gradients":
+                    grads = msg.get("gradients")   # worker envía "gradients"
+                    loss  = msg.get("loss")
+                    epoch = msg.get("epoch")
+
+                    async with state.lock:
+                        state.worker_gradients[worker_id] = grads
+                        state.worker_losses[worker_id]    = loss
+
+                    print(f"[Worker {worker_id}] Gradientes recibidos "
+                          f"(época {epoch}, loss: {loss:.4f})")
+
+                    # Si todos los workers respondieron, liberar el evento
+                    async with state.lock:
+                        if len(state.worker_gradients) == len(state.worker_writers):
+                            print(f"[Training] Todos los gradientes recibidos — época {epoch}")
+                            state.all_workers_ready.set()
+
+                elif mtype == "ping":
+                    await send_json(writer, {"type": "pong"})
+
+            except asyncio.TimeoutError:
+                # Heartbeat
+                try:
+                    await send_json(writer, {"type": "ping"})
+                except Exception:
+                    break
+
+    except (ConnectionError, asyncio.CancelledError) as e:
+        print(f"[Worker {worker_id}] Conexión perdida: {e}")
     except Exception as e:
-        print(f"[Worker {worker_id}] ERROR: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"[Worker {worker_id}] Error inesperado: {e}")
+        import traceback; traceback.print_exc()
     finally:
-        # Eliminar worker de los diccionarios de manera segura
         async with state.lock:
             state.worker_writers.pop(worker_id, None)
             state.worker_readers.pop(worker_id, None)
-        
+            state.worker_chunks.pop(worker_id, None)
+            state.worker_ready.pop(worker_id, None)
+            state.workers_ready.pop(worker_id, None)
         try:
             writer.close()
             await writer.wait_closed()
-            print(f"[Worker {worker_id}] Conexión cerrada")
-        except:
+        except Exception:
             pass
+        print(f"[Worker {worker_id}] Conexión cerrada limpiamente")
