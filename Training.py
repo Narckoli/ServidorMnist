@@ -1,48 +1,132 @@
 # Training.py - Servidor
+"""
+Correcciones respecto a la versión anterior:
+
+1. SINCRONIZACIÓN DE PESOS COMPLETA
+   named_parameters() omite los buffers de BatchNorm (running_mean,
+   running_var, num_batches_tracked). Ahora se usa state_dict() completo
+   tanto para enviar pesos al worker como para cargarlos en el modelo
+   del servidor antes de evaluar.
+
+2. MOMENTUM EN LA ACTUALIZACIÓN DE PESOS (SGD con momentum=0.9)
+   La actualización simple  w ← w - lr·g  hace que el loss oscile sin
+   converger en redes profundas. Se añade un acumulador de velocidad
+   que suaviza la trayectoria de descenso.
+
+3. LEARNING RATE AUTOMÁTICO PARA CNN
+   Si el usuario pone lr >= 0.01 con CNN, se ajusta automáticamente a
+   0.001 para evitar divergencia.
+"""
+
 import asyncio
 import time
 import numpy as np
 
 from Config import state
 from Communication import send_json
-from Model import average_gradients, apply_gradients, evaluate_model
 from Export_Metrics import save_epoch_metrics, save_final_summary
 
 
+# ── Helpers internos ──────────────────────────────────────────────────────────
+
+def _evaluate(X, y):
+    """Evalúa el modelo global actual. Carga el state_dict completo en CNN."""
+    if state.model_type == 'cnn' and state.model:
+        import torch
+        full_sd = {
+            k: torch.tensor(np.array(v), dtype=torch.float32)
+            for k, v in state.global_weights.items()
+        }
+        state.model.model.load_state_dict(full_sd, strict=True)
+        return state.model.evaluate(state.X_test, state.y_test)
+    else:
+        from Model import evaluate_model
+        return evaluate_model(state.X_test, state.y_test, state.global_weights)
+
+
+def _average_gradients(gradients_list):
+    if not gradients_list:
+        return {}
+    avg = {}
+    for key in gradients_list[0]:
+        avg[key] = np.mean([np.array(g[key]) for g in gradients_list], axis=0)
+    return avg
+
+
+def _apply_gradients_with_momentum(weights, grads, velocity,
+                                   lr, momentum=0.9):
+    """
+    SGD con momentum:
+        v ← momentum·v + lr·g
+        w ← w - v
+    Solo actualiza las claves que son parámetros entrenables (están en grads).
+    Las claves de BatchNorm que no tienen gradiente (running_mean, etc.)
+    se copian sin cambio.
+    """
+    new_weights  = {}
+    new_velocity = {}
+    for key in weights:
+        if key not in grads:
+            # Buffer de BatchNorm u otro tensor sin gradiente — copiar tal cual
+            new_weights[key]  = weights[key]
+            new_velocity[key] = velocity.get(key, np.zeros_like(weights[key]))
+        else:
+            g = np.clip(np.array(grads[key]), -5.0, 5.0)
+            v = momentum * velocity.get(key, np.zeros_like(g)) + lr * g
+            new_weights[key]  = weights[key] - v
+            new_velocity[key] = v
+    return new_weights, new_velocity
+
+
 async def send_weights_to_worker(writer, weights: dict, epoch: int):
-    """
-    Envía los pesos globales al worker.
-    Formato: {"type":"weights", "epoch":N, "model_type":"mlp"|"cnn", "weights":{...}}
-    Todos los valores numpy se convierten a lista para ser serializables en JSON.
-    """
+    """Envía el state_dict completo (incluye buffers BatchNorm)."""
     serializable = {
-        k: (v.tolist() if isinstance(v, np.ndarray) else v)
+        k: (v.tolist() if isinstance(v, np.ndarray) else
+            v.cpu().numpy().tolist() if hasattr(v, 'cpu') else v)
         for k, v in weights.items()
     }
     await send_json(writer, {
         "type":       "weights",
         "epoch":      epoch,
         "model_type": state.model_type,
-        "weights":    serializable,   # worker accede a msg["weights"]
+        "weights":    serializable,
     })
 
 
+# ── Bucle principal ───────────────────────────────────────────────────────────
+
 async def training_loop():
-    """Bucle principal de entrenamiento federado."""
     print("\n" + "=" * 70)
     print("INICIO DE ENTRENAMIENTO")
     print("=" * 70)
 
-    # ── Inicializar estructuras de sincronización ──────────────────────────────
-    async with state.lock:
-        state.worker_gradients   = {}
-        state.worker_losses      = {}
-        state.all_workers_ready  = asyncio.Event()
-        state.current_epoch      = 0
-        state.training_start_time = time.time()
-        state.epoch_events       = {}
+    # Ajustar lr para CNN si el usuario puso un valor demasiado alto
+    if state.model_type == 'cnn' and state.learning_rate >= 0.01:
+        old_lr = state.learning_rate
+        state.learning_rate = 0.001
+        print(f"⚠  lr={old_lr} demasiado alto para CNN — ajustado a 0.001")
 
-    # ── Esperar setup de todos los workers ────────────────────────────────────
+    async with state.lock:
+        state.worker_gradients    = {}
+        state.worker_losses       = {}
+        state.all_workers_ready   = asyncio.Event()
+        state.current_epoch       = 0
+        state.training_start_time = time.time()
+        state.epoch_events        = {}
+
+    # Para CNN: usar state_dict completo como pesos globales
+    if state.model_type == 'cnn' and state.model:
+        state.global_weights = {
+            k: v.cpu().numpy()
+            for k, v in state.model.model.state_dict().items()
+        }
+        print(f"✓ Pesos CNN desde state_dict completo "
+              f"({len(state.global_weights)} tensores)")
+
+    # Inicializar acumulador de momentum
+    velocity = {k: np.zeros_like(v) for k, v in state.global_weights.items()}
+
+    # Esperar workers
     print("Esperando que todos los workers completen su setup...")
     while True:
         async with state.lock:
@@ -52,15 +136,11 @@ async def training_loop():
         await asyncio.sleep(0.5)
     print("✓ Todos los workers listos\n")
 
-    # ── Evaluación inicial ────────────────────────────────────────────────────
-    if state.model_type == 'cnn' and state.model:
-        init_loss, init_acc = state.model.evaluate(state.X_test, state.y_test)
-    else:
-        init_loss, init_acc = evaluate_model(
-            state.X_test, state.y_test, state.global_weights)
-    print(f"Evaluación inicial — Loss: {init_loss:.4f}, Accuracy: {init_acc:.4f}\n")
+    # Evaluación inicial
+    init_loss, init_acc = _evaluate(state.X_test, state.y_test)
+    print(f"Evaluación inicial — Loss:{init_loss:.4f}  Accuracy:{init_acc:.4f}\n")
 
-    # ── Bucle por épocas ──────────────────────────────────────────────────────
+    # ── Épocas ────────────────────────────────────────────────────────────────
     for epoch in range(state.max_epochs):
         async with state.lock:
             state.current_epoch    = epoch
@@ -73,7 +153,6 @@ async def training_loop():
         print(f"ÉPOCA {epoch + 1}/{state.max_epochs}")
         print("=" * 70)
 
-        # ── Enviar pesos a todos los workers ──────────────────────────────────
         async with state.lock:
             workers_snapshot = list(state.worker_writers.items())
 
@@ -85,53 +164,39 @@ async def training_loop():
             except Exception as e:
                 print(f"   ✗ Error enviando a Worker {wid}: {e}")
 
-        # ── Esperar gradientes ────────────────────────────────────────────────
         print(f"\n[Época {epoch+1}] Esperando gradientes...")
         try:
             async with state.lock:
                 ready_event = state.all_workers_ready
-
-            await asyncio.wait_for(ready_event.wait(), timeout=300.0)
+            await asyncio.wait_for(ready_event.wait(), timeout=600.0)
 
             async with state.lock:
-                gradients_list = list(state.worker_gradients.values())
-                losses_list    = list(state.worker_losses.values())
+                gradients_list         = list(state.worker_gradients.values())
+                losses_list            = list(state.worker_losses.values())
                 worker_losses_snapshot = dict(state.worker_losses)
 
-            # ── Agregar gradientes y actualizar pesos ─────────────────────────
-            if state.model_type == 'cnn' and state.model:
-                avg_grads = state.model.average_gradients(gradients_list)
-                state.global_weights = state.model.apply_gradients(
-                    state.global_weights, avg_grads, state.learning_rate)
-            else:
-                avg_grads = average_gradients(gradients_list, state.global_weights)
-                state.global_weights = apply_gradients(
-                    state.global_weights, avg_grads, state.learning_rate)
+            # Agregar y actualizar con momentum
+            avg_grads = _average_gradients(gradients_list)
+            state.global_weights, velocity = _apply_gradients_with_momentum(
+                state.global_weights, avg_grads, velocity,
+                lr=state.learning_rate, momentum=0.9,
+            )
 
             avg_loss = float(np.mean(losses_list))
-
-            # ── Evaluar modelo actualizado ────────────────────────────────────
-            if state.model_type == 'cnn' and state.model:
-                test_loss, test_acc = state.model.evaluate(state.X_test, state.y_test)
-            else:
-                test_loss, test_acc = evaluate_model(
-                    state.X_test, state.y_test, state.global_weights)
+            test_loss, test_acc = _evaluate(state.X_test, state.y_test)
 
             async with state.lock:
                 epoch_time = time.time() - state.epoch_start_time
 
-            # ── Guardar métricas en state ─────────────────────────────────────
             state.train_losses.append(avg_loss)
             state.test_losses.append(test_loss)
             state.test_accuracies.append(test_acc)
             state.epoch_times.append(epoch_time)
 
-            # Historial por worker
             async with state.lock:
-                for wid, loss_val in worker_losses_snapshot.items():
-                    state.worker_loss_history.setdefault(wid, []).append(loss_val)
+                for wid, lv in worker_losses_snapshot.items():
+                    state.worker_loss_history.setdefault(wid, []).append(lv)
 
-            # ── Exportar métricas de la época ─────────────────────────────────
             save_epoch_metrics(epoch, avg_loss, test_loss, test_acc,
                                epoch_time, worker_losses_snapshot)
 
@@ -145,8 +210,9 @@ async def training_loop():
             async with state.lock:
                 received = len(state.worker_gradients)
                 expected = len(state.worker_writers)
-                missing  = set(state.worker_writers.keys()) - set(state.worker_gradients.keys())
-            print(f"\n✗ Timeout época {epoch+1}: {received}/{expected} workers respondieron")
+                missing  = set(state.worker_writers.keys()) - \
+                           set(state.worker_gradients.keys())
+            print(f"\n✗ Timeout época {epoch+1}: {received}/{expected} respondieron")
             print(f"  Workers faltantes: {missing}")
             break
 
@@ -157,17 +223,11 @@ async def training_loop():
 
         print()
 
-    # ── Evaluación final ──────────────────────────────────────────────────────
+    # ── Final ─────────────────────────────────────────────────────────────────
     print("\n" + "=" * 70)
     print("ENTRENAMIENTO COMPLETADO")
     print("=" * 70)
-
-    if state.model_type == 'cnn' and state.model:
-        final_loss, final_acc = state.model.evaluate(state.X_test, state.y_test)
-    else:
-        final_loss, final_acc = evaluate_model(
-            state.X_test, state.y_test, state.global_weights)
-
+    final_loss, final_acc = _evaluate(state.X_test, state.y_test)
     total_time = time.time() - state.training_start_time
     print(f"Loss final: {final_loss:.4f} | Accuracy final: {final_acc:.4f}")
     print(f"Tiempo total: {total_time:.2f}s")
