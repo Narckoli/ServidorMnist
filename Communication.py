@@ -95,7 +95,7 @@ async def handle_worker(reader, writer, worker_id: int, chunk: np.ndarray):
         # ── Bucle de entrenamiento ──────────────────────────────────
         while state.training_active:
             try:
-                msg = await asyncio.wait_for(recv_json(reader), timeout=300.0)
+                msg = await asyncio.wait_for(recv_json(reader), timeout=600.0)
                 if msg is None:
                     print(f"[Worker {worker_id}] Conexión cerrada")
                     break
