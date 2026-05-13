@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Worker de entrenamiento distribuido asincrono para EfficientNetLite-0.
+Servidor de entrenamiento distribuido asincrono para EfficientNetLite-0.
+Mide tiempo, accuracy y guarda resultados en JSON.
 """
 
 import asyncio
@@ -9,185 +10,95 @@ import pickle
 import logging
 import argparse
 import random
-import platform
-import psutil
-import os
 import json
-import socket
+import time
 from datetime import datetime
 from pathlib import Path
+from collections import defaultdict
+from dataclasses import dataclass, field, asdict
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset
-import torchvision
-import torchvision.transforms as transforms
 
 logging.basicConfig(
     level=logging.INFO,
     format='[%(asctime)s] [%(levelname)s] %(message)s',
     datefmt='%H:%M:%S'
 )
-logger = logging.getLogger("Worker")
+logger = logging.getLogger("Server")
 
 
-# ==================== CONFIGURACION DEL SERVIDOR ====================
-CONFIG_FILE = Path.home() / ".dist_train_config.json"
-ENV_VAR_HOST = "DIST_SERVER_HOST"
-ENV_VAR_PORT = "DIST_SERVER_PORT"
-DEFAULT_HOST = "localhost"
-DEFAULT_PORT = 8765
-
-
-def load_config_file():
-    if CONFIG_FILE.exists():
-        try:
-            with open(CONFIG_FILE, 'r') as f:
-                config = json.load(f)
-            logger.info(f"Config cargada desde {CONFIG_FILE}")
-            return config.get('server_host'), config.get('server_port')
-        except Exception as e:
-            logger.warning(f"Error leyendo config: {e}")
-    return None, None
-
-
-def save_config_file(host, port):
-    try:
-        config = {}
-        if CONFIG_FILE.exists():
-            with open(CONFIG_FILE, 'r') as f:
-                config = json.load(f)
-        config['server_host'] = host
-        config['server_port'] = port
-        with open(CONFIG_FILE, 'w') as f:
-            json.dump(config, f, indent=2)
-        logger.info(f"Config guardada en {CONFIG_FILE}")
-    except Exception as e:
-        logger.warning(f"Error guardando config: {e}")
-
-
-def get_env_config():
-    host = os.environ.get(ENV_VAR_HOST)
-    port = os.environ.get(ENV_VAR_PORT)
-    if host:
-        logger.info(f"Env var: {ENV_VAR_HOST}={host}")
-        return host, int(port) if port else DEFAULT_PORT
-    return None, None
-
-
-def discover_server_on_network(port=8765, timeout=2.0):
-    logger.info("Escaneando red local...")
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        local_ip = s.getsockname()[0]
-        s.close()
-        subnet = ".".join(local_ip.split(".")[:3])
-        logger.info(f"Subred: {subnet}.x (mi IP: {local_ip})")
-    except Exception:
-        logger.warning("No se pudo detectar subred")
-        return None, None
+# ==================== RESULTADOS DEL ENTRENAMIENTO ====================
+@dataclass
+class TrainingResult:
+    training_id: str = ""
+    start_time: str = ""
+    end_time: str = ""
+    num_workers: int = 0
+    num_classes: int = 10
+    batch_size: int = 16
+    chunk_size: int = 10
+    max_epochs: int = 10
+    learning_rate: float = 0.001
+    dataset: str = "cifar10"
+    total_epochs_completed: int = 0
+    total_updates: int = 0
+    final_loss: float = 0.0
+    final_accuracy: float = 0.0
+    total_seconds: float = 0.0
+    avg_epoch_seconds: float = 0.0
+    worker_hardware: dict = field(default_factory=dict)
+    worker_updates: dict = field(default_factory=dict)
+    epoch_history: list = field(default_factory=list)
     
-    common_ips = [1, 10, 100, 2, 5, 254, 50, 20, 30]
-    for last_octet in common_ips:
-        host = f"{subnet}.{last_octet}"
-        if host == local_ip:
-            continue
-        if _try_connect(host, port, timeout):
-            logger.info(f"Servidor en {host}:{port}")
-            return host, port
+    def to_dict(self):
+        return asdict(self)
     
-    logger.info("Escaneando subred completa...")
-    for last_octet in range(1, 255):
-        if last_octet in common_ips:
-            continue
-        host = f"{subnet}.{last_octet}"
-        if host == local_ip:
-            continue
-        if _try_connect(host, port, timeout):
-            logger.info(f"Servidor en {host}:{port}")
-            return host, port
+    def save(self, output_dir: Path = None):
+        if output_dir is None:
+            output_dir = Path.home() / "training_results"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"training_{self.training_id}.json"
+        filepath = output_dir / filename
+        with open(filepath, 'w') as f:
+            json.dump(self.to_dict(), f, indent=2, default=str)
+        logger.info(f"Resultados guardados en: {filepath}")
+        return filepath
     
-    logger.warning("No se encontro servidor")
-    return None, None
-
-
-def _try_connect(host, port, timeout):
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(timeout)
-        result = s.connect_ex((host, port))
-        s.close()
-        return result == 0
-    except:
-        return False
-
-
-def resolve_server_config(args_host, args_port, auto_discover=False):
-    logger.info("Resolviendo configuracion del servidor...")
+    def print_summary(self):
+        print("\n" + "=" * 70)
+        print("RESUMEN DEL ENTRENAMIENTO")
+        print("=" * 70)
+        print(f"   ID:              {self.training_id}")
+        print(f"   Inicio:          {self.start_time}")
+        print(f"   Fin:             {self.end_time}")
+        print(f"   Duracion:        {self._format_time(self.total_seconds)}")
+        print("-" * 70)
+        print(f"   Dataset:         {self.dataset.upper()}")
+        print(f"   Workers:         {self.num_workers}")
+        print(f"   Epocas:          {self.total_epochs_completed} / {self.max_epochs}")
+        print(f"   Batch size:      {self.batch_size}")
+        print(f"   Learning rate:   {self.learning_rate}")
+        print("-" * 70)
+        print(f"   Total updates:   {self.total_updates}")
+        print(f"   Loss final:      {self.final_loss:.6f}")
+        print(f"   Accuracy final:  {self.final_accuracy:.2f}%")
+        print("-" * 70)
+        print("   Hardware de workers:")
+        for wid, hw in self.worker_hardware.items():
+            print(f"      Worker {wid}: {hw.get('cpu', 'Unknown')} ({hw.get('tier', '?')})")
+        print("=" * 70)
     
-    if args_host and args_host != DEFAULT_HOST:
-        logger.info(f"1. Argumento: {args_host}:{args_port}")
-        save_config_file(args_host, args_port)
-        return args_host, args_port
-    
-    env_host, env_port = get_env_config()
-    if env_host:
-        logger.info(f"2. Env var: {env_host}:{env_port}")
-        save_config_file(env_host, env_port)
-        return env_host, env_port
-    
-    file_host, file_port = load_config_file()
-    if file_host:
-        logger.info(f"3. Config file: {file_host}:{file_port or DEFAULT_PORT}")
-        return file_host, file_port or DEFAULT_PORT
-    
-    if auto_discover:
-        discovered_host, discovered_port = discover_server_on_network(DEFAULT_PORT)
-        if discovered_host:
-            logger.info(f"4. Descubierto: {discovered_host}:{discovered_port}")
-            save_config_file(discovered_host, discovered_port)
-            return discovered_host, discovered_port
-    
-    logger.info(f"5. Default: {DEFAULT_HOST}:{DEFAULT_PORT}")
-    return DEFAULT_HOST, DEFAULT_PORT
-
-
-# ==================== DETECCION DE HARDWARE ====================
-def detect_hardware():
-    cpu_info = platform.processor() or "Unknown"
-    cpu_count = psutil.cpu_count(logical=True)
-    cpu_freq = psutil.cpu_freq().max if psutil.cpu_freq() else 0
-    ram_gb = psutil.virtual_memory().total / (1024**3)
-    
-    if "i9" in cpu_info or cpu_count >= 16:
-        tier = "high"
-    elif "i7" in cpu_info or "Ryzen 7" in cpu_info or cpu_count >= 12:
-        tier = "medium"
-    else:
-        tier = "low"
-    
-    return {
-        "cpu": cpu_info,
-        "cores_logical": cpu_count,
-        "cores_physical": psutil.cpu_count(logical=False),
-        "cpu_freq_mhz": cpu_freq,
-        "ram_gb": round(ram_gb, 1),
-        "tier": tier,
-        "has_cuda": torch.cuda.is_available(),
-        "cuda_devices": torch.cuda.device_count() if torch.cuda.is_available() else 0
-    }
-
-
-def get_optimal_config(hardware_info):
-    tier = hardware_info.get("tier", "low")
-    if tier == "high":
-        return {"batch_size": 64, "num_workers": 4, "prefetch": True}
-    elif tier == "medium":
-        return {"batch_size": 32, "num_workers": 2, "prefetch": True}
-    else:
-        return {"batch_size": 16, "num_workers": 0, "prefetch": False}
+    def _format_time(self, seconds: float) -> str:
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        if hours > 0:
+            return f"{hours}h {minutes}m {secs}s"
+        elif minutes > 0:
+            return f"{minutes}m {secs}s"
+        else:
+            return f"{secs:.1f}s"
 
 
 # ==================== MODELO ====================
@@ -254,6 +165,39 @@ class EfficientNetLite0(nn.Module):
         x = self.stem(x); x = self.blocks(x); x = self.head(x); x = x.view(x.size(0), -1); x = self.classifier(x); return x
 
 
+# ==================== DATASET MANAGER ====================
+@dataclass
+class DistributedDatasetManager:
+    total_samples: int = 50000
+    batch_size: int = 16
+    num_workers: int = 1
+    chunk_size: int = 10
+    seed: int = 42
+    total_batches: int = field(init=False)
+    total_chunks: int = field(init=False)
+    chunks_per_worker: int = field(init=False)
+    current_epoch: int = field(default=0)
+    epoch_assignments: dict = field(default_factory=dict)
+    
+    def __post_init__(self):
+        self.total_batches = (self.total_samples + self.batch_size - 1) // self.batch_size
+        self.total_chunks = (self.total_batches + self.chunk_size - 1) // self.chunk_size
+        self.chunks_per_worker = self.total_chunks // self.num_workers
+    
+    def generate_epoch_assignment(self, epoch: int) -> dict:
+        rng = random.Random(self.seed + epoch)
+        all_chunks = list(range(self.total_chunks))
+        rng.shuffle(all_chunks)
+        assignment = {}
+        base = self.chunks_per_worker
+        for w in range(self.num_workers):
+            start = w * base
+            end = start + base if w < self.num_workers - 1 else len(all_chunks)
+            assignment[w] = sorted(all_chunks[start:end])
+        self.epoch_assignments[epoch] = assignment
+        return assignment
+
+
 # ==================== PROTOCOLO ====================
 async def send_msg(writer, data):
     payload = pickle.dumps(data)
@@ -268,302 +212,371 @@ async def recv_msg(reader):
     return pickle.loads(payload)
 
 
-# ==================== DATASET ====================
-class ChunkedDataset:
-    def __init__(self, dataset_name='cifar10', data_dir='./data', batch_size=32, chunk_size=10):
-        self.dataset_name = dataset_name
-        self.data_dir = data_dir
+# ==================== SERVIDOR ====================
+class AsyncDistServer:
+    def __init__(self, host='0.0.0.0', port=5000, num_workers=1, 
+                 num_classes=10, lr=0.001, dataset='cifar10',
+                 batch_size=16, chunk_size=10, max_epochs=10,
+                 save_results=True, results_dir=None):
+        self.host = host
+        self.port = port
+        self.num_workers = num_workers
+        self.lr = lr
+        self.dataset = dataset
         self.batch_size = batch_size
-        self.chunk_size = chunk_size
-        self.full_dataset = self._load_dataset()
-        self.total_samples = len(self.full_dataset)
-        self.total_batches = (self.total_samples + batch_size - 1) // batch_size
-        self.total_chunks = (self.total_batches + chunk_size - 1) // chunk_size
-        logger.info(f"Dataset: {dataset_name} | {self.total_samples} muestras | {self.total_chunks} chunks")
-    
-    def _load_dataset(self):
-        if self.dataset_name == 'cifar10':
+        self.max_epochs = max_epochs
+        self.save_results = save_results
+        
+        if results_dir:
+            self.results_dir = Path(results_dir)
+        else:
+            project_dir = Path(__file__).parent.resolve()
+            self.results_dir = project_dir / "Resultados"
+        
+        self.model = EfficientNetLite0(num_classes=num_classes)
+        self.optimizer = torch.optim.SGD(self.model.parameters(), lr=lr, momentum=0.9)
+        
+        if dataset == 'cifar10':
+            total_samples = 50000
+        else:
+            total_samples = 10000
+        self.dataset_manager = DistributedDatasetManager(
+            total_samples=total_samples, batch_size=batch_size,
+            num_workers=num_workers, chunk_size=chunk_size, seed=42
+        )
+        
+        self.workers = {}
+        self.worker_info = {}
+        self.lock = asyncio.Lock()
+        self.all_connected = asyncio.Event()
+        
+        self.global_step = 0
+        self.total_updates = 0
+        self.current_epoch = 0
+        
+        self.result = TrainingResult()
+        self.result.training_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.result.num_workers = num_workers
+        self.result.num_classes = num_classes
+        self.result.batch_size = batch_size
+        self.result.chunk_size = chunk_size
+        self.result.max_epochs = max_epochs
+        self.result.learning_rate = lr
+        self.result.dataset = dataset
+        
+        self.start_time = None
+        self.epoch_start_times = {}
+        self.epoch_losses = {}
+
+    async def handle_worker(self, reader, writer):
+        addr = writer.get_extra_info('peername')
+        worker_id = None
+        
+        try:
+            msg = await recv_msg(reader)
+            if msg['type'] != 'handshake':
+                return
+            
+            hardware_info = msg.get('hardware', 'unknown')
+            
+            async with self.lock:
+                worker_id = len(self.workers)
+                self.workers[worker_id] = (reader, writer)
+                self.worker_info[worker_id] = {
+                    'hardware': hardware_info,
+                    'connected_at': datetime.now().isoformat(),
+                    'addr': addr,
+                    'updates_received': 0
+                }
+                self.result.worker_hardware[worker_id] = hardware_info
+                logger.info(f"Worker {worker_id} conectado | {hardware_info.get('cpu', 'Unknown')}")
+            
+            await send_msg(writer, {
+                'type': 'assign_id',
+                'worker_id': worker_id,
+                'total_workers': self.num_workers,
+                'batch_size': self.batch_size,
+                'chunk_size': self.dataset_manager.chunk_size,
+                'total_samples': self.dataset_manager.total_samples,
+                'dataset': self.dataset,
+                'max_epochs': self.max_epochs
+            })
+            
+            if len(self.workers) == self.num_workers:
+                self.start_time = time.time()
+                self.result.start_time = datetime.now().isoformat()
+                logger.info("=" * 70)
+                logger.info("TODOS LOS WORKERS CONECTADOS")
+                logger.info(f"   Training ID: {self.result.training_id}")
+                logger.info(f"   Epocas: {self.max_epochs}")
+                logger.info(f"   Inicio: {self.result.start_time}")
+                logger.info("=" * 70)
+                self.all_connected.set()
+            else:
+                remaining = self.num_workers - len(self.workers)
+                logger.info(f"Esperando {remaining} worker(s)...")
+                await self.all_connected.wait()
+            
+            await self.broadcast_epoch_start(epoch=0)
+            
+            while True:
+                msg = await recv_msg(reader)
+                
+                if msg['type'] == 'gradients':
+                    worker_grads = msg['gradients']
+                    step = msg['step']
+                    loss = msg.get('loss', 0.0)
+                    epoch = msg.get('epoch', 0)
+                    
+                    async with self.lock:
+                        self.apply_gradients(worker_grads)
+                        self.total_updates += 1
+                        self.global_step = step
+                        self.worker_info[worker_id]['updates_received'] += 1
+                        
+                        if epoch not in self.epoch_losses:
+                            self.epoch_losses[epoch] = []
+                        self.epoch_losses[epoch].append(loss)
+                        
+                        logger.info(f"W{worker_id} | Ep{epoch}/{self.max_epochs} | Loss:{loss:.4f} | Updates:{self.total_updates}")
+                    
+                    await self.send_model_to_worker(writer, epoch=epoch)
+                    
+                elif msg['type'] == 'epoch_complete':
+                    completed_epoch = msg['epoch']
+                    avg_loss = msg.get('avg_loss', 0.0)
+                    
+                    epoch_end_time = time.time()
+                    if completed_epoch in self.epoch_start_times:
+                        epoch_duration = epoch_end_time - self.epoch_start_times[completed_epoch]
+                    else:
+                        epoch_duration = 0.0
+                    
+                    self.result.epoch_history.append({
+                        'epoch': completed_epoch,
+                        'avg_loss': avg_loss,
+                        'duration_seconds': round(epoch_duration, 2),
+                        'timestamp': datetime.now().isoformat()
+                    })
+                    
+                    logger.info(f"Worker {worker_id} completo epoca {completed_epoch}/{self.max_epochs} ({epoch_duration:.1f}s)")
+                    
+                    async with self.lock:
+                        self.worker_info[worker_id]['last_completed_epoch'] = completed_epoch
+                        all_done = all(
+                            self.worker_info.get(w, {}).get('last_completed_epoch', -1) >= completed_epoch
+                            for w in self.workers
+                        )
+                    
+                    if all_done and completed_epoch < self.max_epochs - 1:
+                        next_epoch = completed_epoch + 1
+                        logger.info(f"Iniciando epoca {next_epoch}/{self.max_epochs}")
+                        await self.broadcast_epoch_start(epoch=next_epoch)
+                        
+                    elif all_done and completed_epoch >= self.max_epochs - 1:
+                        await self.finish_training()
+                        await self.broadcast_training_done()
+                    
+                elif msg['type'] == 'heartbeat':
+                    await send_msg(writer, {'type': 'heartbeat_ack'})
+                    
+                elif msg['type'] == 'done':
+                    logger.info(f"Worker {worker_id} finalizo")
+                    break
+                    
+        except asyncio.IncompleteReadError:
+            logger.warning(f"Worker {worker_id} desconectado")
+        except Exception as e:
+            logger.error(f"Error Worker {worker_id}: {e}")
+        finally:
+            if worker_id is not None:
+                async with self.lock:
+                    if worker_id in self.workers:
+                        del self.workers[worker_id]
+                    if worker_id in self.worker_info:
+                        del self.worker_info[worker_id]
+            writer.close()
+            await writer.wait_closed()
+
+    def apply_gradients(self, worker_grads):
+        self.optimizer.zero_grad()
+        for name, param in self.model.named_parameters():
+            if name in worker_grads:
+                grad_tensor = worker_grads[name]
+                if param.grad is None:
+                    param.grad = grad_tensor.clone()
+                else:
+                    param.grad += grad_tensor
+        self.optimizer.step()
+
+    async def broadcast_epoch_start(self, epoch: int):
+        self.epoch_start_times[epoch] = time.time()
+        self.current_epoch = epoch
+        
+        assignment = self.dataset_manager.generate_epoch_assignment(epoch)
+        state_dict = self.model.state_dict()
+        
+        msg = {
+            'type': 'epoch_start',
+            'epoch': epoch,
+            'state_dict': state_dict,
+            'global_step': self.global_step,
+            'chunk_assignment': assignment,
+            'max_epochs': self.max_epochs
+        }
+        
+        tasks = [send_msg(w, msg) for _, (_, w) in self.workers.items()]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+            logger.info(f"Epoca {epoch}/{self.max_epochs} iniciada")
+
+    async def broadcast_training_done(self):
+        msg = {
+            'type': 'training_done',
+            'total_epochs': self.max_epochs,
+            'total_updates': self.total_updates
+        }
+        tasks = [send_msg(w, msg) for _, (_, w) in self.workers.items()]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def finish_training(self):
+        logger.info("FINALIZANDO ENTRENAMIENTO...")
+        
+        end_time = time.time()
+        total_seconds = end_time - self.start_time if self.start_time else 0
+        
+        final_loss = 0.0
+        if self.max_epochs - 1 in self.epoch_losses and self.epoch_losses[self.max_epochs - 1]:
+            final_loss = sum(self.epoch_losses[self.max_epochs - 1]) / len(self.epoch_losses[self.max_epochs - 1])
+        elif self.epoch_losses:
+            last_epoch = max(self.epoch_losses.keys())
+            final_loss = sum(self.epoch_losses[last_epoch]) / len(self.epoch_losses[last_epoch])
+        
+        final_accuracy = await self.evaluate_model()
+        
+        self.result.end_time = datetime.now().isoformat()
+        self.result.total_seconds = round(total_seconds, 2)
+        self.result.total_epochs_completed = len(self.result.epoch_history)
+        self.result.total_updates = self.total_updates
+        self.result.final_loss = round(final_loss, 6)
+        self.result.final_accuracy = round(final_accuracy, 2)
+        
+        if self.result.epoch_history:
+            total_epoch_time = sum(e.get('duration_seconds', 0) for e in self.result.epoch_history)
+            self.result.avg_epoch_seconds = round(total_epoch_time / len(self.result.epoch_history), 2)
+        
+        for wid, info in self.worker_info.items():
+            self.result.worker_updates[wid] = info.get('updates_received', 0)
+        
+        self.result.print_summary()
+        
+        if self.save_results:
+            filepath = self.result.save(self.results_dir)
+            logger.info(f"Resultados guardados en: {filepath}")
+        
+        return self.result
+
+    async def evaluate_model(self) -> float:
+        try:
+            import torchvision
+            import torchvision.transforms as transforms
+            
             transform = transforms.Compose([
                 transforms.Resize((224, 224)),
-                transforms.RandomHorizontalFlip(),
-                transforms.RandomRotation(10),
                 transforms.ToTensor(),
                 transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616))
             ])
-            return torchvision.datasets.CIFAR10(root=self.data_dir, train=True, download=True, transform=transform)
-        else:
-            X = torch.randn(10000, 3, 224, 224)
-            y = torch.randint(0, 10, (10000,))
-            from torch.utils.data import TensorDataset
-            return TensorDataset(X, y)
-    
-    def get_sample_indices_for_chunks(self, chunk_indices):
-        indices = []
-        for chunk_idx in sorted(chunk_indices):
-            start_batch = chunk_idx * self.chunk_size
-            end_batch = min(start_batch + self.chunk_size, self.total_batches)
-            start_sample = start_batch * self.batch_size
-            end_sample = min(end_batch * self.batch_size, self.total_samples)
-            indices.extend(range(start_sample, end_sample))
-        return indices
-    
-    def create_dataloader(self, chunk_indices, num_workers=0):
-        sample_indices = self.get_sample_indices_for_chunks(chunk_indices)
-        subset = Subset(self.full_dataset, sample_indices)
-        return DataLoader(subset, batch_size=self.batch_size, shuffle=True, num_workers=num_workers, pin_memory=False, drop_last=False)
-
-
-# ==================== WORKER ====================
-class AsyncDistWorker:
-    def __init__(self, server_host='localhost', server_port=8765, num_classes=10, data_dir='./data'):
-        self.server_host = server_host
-        self.server_port = server_port
-        self.num_classes = num_classes
-        self.data_dir = data_dir
-        
-        self.worker_id = None
-        self.total_workers = None
-        self.model = None
-        self.optimizer = None
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        
-        self.hardware_info = detect_hardware()
-        self.optimal_config = get_optimal_config(self.hardware_info)
-        
-        self.chunked_dataset = None
-        self.max_epochs = None  # Se recibe del servidor
-        
-        logger.info("=" * 60)
-        logger.info("WORKER INICIANDO")
-        logger.info(f"   Hardware: {self.hardware_info['cpu']}")
-        logger.info(f"   Tier: {self.hardware_info['tier']}")
-        logger.info(f"   Cores: {self.hardware_info['cores_physical']}F/{self.hardware_info['cores_logical']}T")
-        logger.info(f"   RAM: {self.hardware_info['ram_gb']} GB")
-        logger.info("=" * 60)
-
-    def create_model(self, state_dict=None):
-        self.model = EfficientNetLite0(num_classes=self.num_classes).to(self.device)
-        if state_dict is not None:
-            self.model.load_state_dict(state_dict)
-        self.criterion = nn.CrossEntropyLoss()
-        self.optimizer = torch.optim.SGD(self.model.parameters(), lr=0.001, momentum=0.9)
-        logger.info(f"Modelo creado en {self.device}")
-
-    def compute_gradients(self, data, target):
-        self.model.train()
-        data, target = data.to(self.device), target.to(self.device)
-        self.optimizer.zero_grad()
-        output = self.model(data)
-        loss = self.criterion(output, target)
-        loss.backward()
-        gradients = {}
-        for name, param in self.model.named_parameters():
-            if param.grad is not None:
-                gradients[name] = param.grad.cpu().clone()
-        return gradients, loss.item()
-
-    def update_model(self, state_dict):
-        self.model.load_state_dict(state_dict)
-
-    async def run(self):
-        logger.info(f"Conectando a {self.server_host}:{self.server_port}...")
-        
-        try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(self.server_host, self.server_port),
-                timeout=10.0
+            
+            test_dataset = torchvision.datasets.CIFAR10(
+                root='./data', train=False, download=True, transform=transform
             )
-        except asyncio.TimeoutError:
-            logger.error(f"Timeout conectando a {self.server_host}:{self.server_port}")
-            return
-        except Exception as e:
-            logger.error(f"Error de conexion: {e}")
-            return
-        
-        try:
-            # 1. Handshake
-            await send_msg(writer, {'type': 'handshake', 'hardware': self.hardware_info})
-            
-            # 2. Recibir ID + max_epochs del servidor
-            response = await recv_msg(reader)
-            if response['type'] == 'assign_id':
-                self.worker_id = response['worker_id']
-                self.total_workers = response['total_workers']
-                server_batch_size = response['batch_size']
-                chunk_size = response['chunk_size']
-                dataset_name = response['dataset']
-                self.max_epochs = response.get('max_epochs', 10)
-                
-                logger.info("=" * 60)
-                logger.info("ASIGNACION RECIBIDA DEL SERVIDOR")
-                logger.info(f"   Worker ID: {self.worker_id} / {self.total_workers}")
-                logger.info(f"   Dataset: {dataset_name}")
-                logger.info(f"   Batch size: {server_batch_size}")
-                logger.info(f"   Chunk size: {chunk_size}")
-                logger.info(f"   EPOCAS TOTALES: {self.max_epochs}")
-                logger.info("=" * 60)
-            
-            # 3. Cargar dataset
-            self.chunked_dataset = ChunkedDataset(
-                dataset_name=dataset_name,
-                data_dir=self.data_dir,
-                batch_size=server_batch_size,
-                chunk_size=chunk_size
+            test_loader = torch.utils.data.DataLoader(
+                test_dataset, batch_size=64, shuffle=False, num_workers=0
             )
             
-            # 4. Esperar modelo inicial
-            logger.info("Esperando modelo inicial...")
-            msg = await recv_msg(reader)
+            self.model.eval()
+            correct = 0
+            total = 0
             
-            if msg['type'] == 'epoch_start':
-                epoch = msg['epoch']
-                state_dict = msg['state_dict']
-                chunk_assignment = msg['chunk_assignment']
-                if 'max_epochs' in msg:
-                    self.max_epochs = msg['max_epochs']
-                
-                self.create_model(state_dict)
-                
-                my_chunks = chunk_assignment.get(self.worker_id, [])
-                logger.info(f"Epoca {epoch}/{self.max_epochs} | Chunks: {my_chunks[:10]}...")
-                
-                train_loader = self.chunked_dataset.create_dataloader(
-                    my_chunks,
-                    num_workers=self.optimal_config['num_workers']
-                )
-            else:
-                raise ValueError(f"Mensaje inesperado: {msg['type']}")
+            with torch.no_grad():
+                for data, target in test_loader:
+                    output = self.model(data)
+                    _, predicted = torch.max(output.data, 1)
+                    total += target.size(0)
+                    correct += (predicted == target).sum().item()
             
-            # 5. Bucle de entrenamiento
-            global_step = 0
-            current_epoch = epoch
-            
-            while current_epoch < self.max_epochs:
-                epoch_loss = 0.0
-                num_batches = 0
-                
-                logger.info(f"Worker {self.worker_id} | Epoca {current_epoch}/{self.max_epochs}")
-                
-                for batch_idx, (data, target) in enumerate(train_loader):
-                    gradients, loss = self.compute_gradients(data, target)
-                    epoch_loss += loss
-                    num_batches += 1
-                    global_step += 1
-                    
-                    await send_msg(writer, {
-                        'type': 'gradients',
-                        'gradients': gradients,
-                        'step': global_step,
-                        'loss': loss,
-                        'worker_id': self.worker_id,
-                        'epoch': current_epoch
-                    })
-                    
-                    try:
-                        msg = await asyncio.wait_for(recv_msg(reader), timeout=60.0)
-                        
-                        if msg['type'] == 'model_update':
-                            self.update_model(msg['state_dict'])
-                            
-                        elif msg['type'] == 'epoch_start':
-                            new_epoch = msg['epoch']
-                            new_state_dict = msg['state_dict']
-                            new_assignment = msg['chunk_assignment']
-                            if 'max_epochs' in msg:
-                                self.max_epochs = msg['max_epochs']
-                            
-                            self.update_model(new_state_dict)
-                            current_epoch = new_epoch
-                            
-                            my_chunks = new_assignment.get(self.worker_id, [])
-                            logger.info(f"NUEVA EPOCA {current_epoch}/{self.max_epochs}")
-                            
-                            train_loader = self.chunked_dataset.create_dataloader(
-                                my_chunks,
-                                num_workers=self.optimal_config['num_workers']
-                            )
-                            break
-                            
-                        elif msg['type'] == 'training_done':
-                            logger.info("Servidor indica fin del entrenamiento!")
-                            return
-                            
-                    except asyncio.TimeoutError:
-                        logger.warning("Timeout esperando modelo. Continuando...")
-                    
-                    if batch_idx % 20 == 0:
-                        logger.info(f"   Worker {self.worker_id} | Epoch {current_epoch}/{self.max_epochs} | "
-                                    f"Batch {batch_idx}/{len(train_loader)} | Loss: {loss:.4f}")
-                
-                # Epoca completada
-                avg_loss = epoch_loss / max(num_batches, 1)
-                logger.info(f"Worker {self.worker_id} | Epoca {current_epoch}/{self.max_epochs} COMPLETADA | Loss: {avg_loss:.4f}")
-                
-                await send_msg(writer, {
-                    'type': 'epoch_complete',
-                    'epoch': current_epoch,
-                    'worker_id': self.worker_id,
-                    'avg_loss': avg_loss
-                })
-                
-                current_epoch += 1
-            
-            await send_msg(writer, {'type': 'done'})
-            logger.info(f"Worker {self.worker_id} finalizo {self.max_epochs} epocas")
+            accuracy = 100 * correct / total
+            logger.info(f"Accuracy en test set: {accuracy:.2f}% ({correct}/{total})")
+            return accuracy
             
         except Exception as e:
-            logger.error(f"Error en Worker: {e}")
-            import traceback
-            traceback.print_exc()
-        finally:
-            writer.close()
-            await writer.wait_closed()
+            logger.warning(f"No se pudo evaluar accuracy: {e}")
+            return 0.0
+
+    async def send_model_to_worker(self, writer, epoch: int = 0):
+        state_dict = self.model.state_dict()
+        await send_msg(writer, {
+            'type': 'model_update',
+            'state_dict': state_dict,
+            'global_step': self.global_step,
+            'epoch': epoch,
+            'max_epochs': self.max_epochs
+        })
+
+    async def start(self):
+        server = await asyncio.start_server(self.handle_worker, self.host, self.port)
+        addrs = ', '.join(str(sock.getsockname()) for sock in server.sockets)
+        
+        logger.info("=" * 70)
+        logger.info("SERVIDOR DE ENTRENAMIENTO DISTRIBUIDO")
+        logger.info(f"   Training ID: {self.result.training_id}")
+        logger.info(f"   Modelo: EfficientNetLite-0")
+        logger.info(f"   Dataset: {self.dataset.upper()}")
+        logger.info(f"   Workers: {self.num_workers}")
+        logger.info(f"   Epocas: {self.max_epochs}")
+        logger.info(f"   Resultados en: {self.results_dir}")
+        logger.info(f"   Escuchando en: {addrs}")
+        logger.info("=" * 70)
+        
+        async with server:
+            await server.serve_forever()
 
 
 # ==================== MAIN ====================
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(
-        description='Worker de entrenamiento distribuido - EfficientNetLite-0',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-EJEMPLOS DE USO:
-================
-
-1. Especificar IP (se guarda automaticamente):
-   python worker.py --server-host 192.168.1.10
-
-2. Usar configuracion guardada (sin argumentos):
-   python worker.py
-
-3. Descubrir servidor automaticamente:
-   python worker.py --auto-discover
-
-NOTA: El numero de epocas lo define el SERVIDOR (--epochs).
-        """
-    )
-    
-    parser.add_argument('--server-host', default=DEFAULT_HOST, help='IP del servidor')
-    parser.add_argument('--server-port', type=int, default=DEFAULT_PORT, help='Puerto')
-    parser.add_argument('--auto-discover', action='store_true', help='Descubrir servidor en red')
+    parser = argparse.ArgumentParser(description='Servidor de entrenamiento distribuido')
+    parser.add_argument('--host', default='0.0.0.0', help='Host')
+    parser.add_argument('--port', type=int, default=5000, help='Puerto')
+    parser.add_argument('--workers', type=int, default=1, help='Workers')
     parser.add_argument('--num-classes', type=int, default=10, help='Clases')
-    parser.add_argument('--data-dir', default='./data', help='Directorio de datos')
+    parser.add_argument('--lr', type=float, default=0.001, help='LR')
+    parser.add_argument('--dataset', default='cifar10', choices=['cifar10', 'synthetic'])
+    parser.add_argument('--batch-size', type=int, default=32)
+    parser.add_argument('--chunk-size', type=int, default=10)
+    parser.add_argument('--epochs', type=int, default=1, help='EPOCAS TOTALES')
+    parser.add_argument('--no-save', action='store_true', help='No guardar resultados')
+    parser.add_argument('--results-dir', type=str, help='Directorio para resultados')
     
     args = parser.parse_args()
     
-    host, port = resolve_server_config(
-        args.server_host, 
-        args.server_port,
-        auto_discover=args.auto_discover
-    )
-    
-    worker = AsyncDistWorker(
-        server_host=host,
-        server_port=port,
+    server = AsyncDistServer(
+        host=args.host,
+        port=args.port,
+        num_workers=args.workers,
         num_classes=args.num_classes,
-        data_dir=args.data_dir
+        lr=args.lr,
+        dataset=args.dataset,
+        batch_size=args.batch_size,
+        chunk_size=args.chunk_size,
+        max_epochs=args.epochs,
+        save_results=not args.no_save,
+        results_dir=args.results_dir
     )
     
     try:
-        asyncio.run(worker.run())
+        asyncio.run(server.start())
     except KeyboardInterrupt:
-        logger.info("Worker detenido")
+        logger.info("Servidor detenido")
+        if server.save_results and server.start_time:
+            asyncio.run(server.finish_training())
