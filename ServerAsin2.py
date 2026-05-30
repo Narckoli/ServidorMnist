@@ -1,7 +1,9 @@
-#!/usr/bin/env python3
 """
-Servidor de entrenamiento distribuido asincrono para EfficientNetLite-0.
-Mide tiempo, accuracy y guarda resultados en JSON.
+Servidor 100% ASINCRONO.
+- NO espera a ningun worker
+- Aplica gradientes tan pronto llegan (con staleness weighting)
+- Workers trabajan a su ritmo, nunca se bloquean
+- Version tracking del modelo para manejar gradientes obsoletos
 """
 
 import asyncio
@@ -12,9 +14,13 @@ import argparse
 import random
 import json
 import time
+import signal
+import sys
+import queue
+import threading
+from collections import deque
 from datetime import datetime
 from pathlib import Path
-from collections import defaultdict
 from dataclasses import dataclass, field, asdict
 
 import torch
@@ -25,31 +31,31 @@ logging.basicConfig(
     format='[%(asctime)s] [%(levelname)s] %(message)s',
     datefmt='%H:%M:%S'
 )
-logger = logging.getLogger("Server")
+logger = logging.getLogger("ServerAsync")
 
 
-# ==================== RESULTADOS DEL ENTRENAMIENTO ====================
+# ==================== RESULTADOS ====================
 @dataclass
 class TrainingResult:
     training_id: str = ""
     start_time: str = ""
     end_time: str = ""
-    num_workers: int = 0
+    num_workers: int = 2
     num_classes: int = 10
     batch_size: int = 16
-    chunk_size: int = 10
-    max_epochs: int = 10
+    max_updates: int = 1000
     learning_rate: float = 0.001
     dataset: str = "cifar10"
-    total_epochs_completed: int = 0
     total_updates: int = 0
     final_loss: float = 0.0
     final_accuracy: float = 0.0
     total_seconds: float = 0.0
-    avg_epoch_seconds: float = 0.0
+    avg_update_seconds: float = 0.0
     worker_hardware: dict = field(default_factory=dict)
     worker_updates: dict = field(default_factory=dict)
-    epoch_history: list = field(default_factory=list)
+    worker_staleness_avg: dict = field(default_factory=dict)
+    update_history: list = field(default_factory=list)
+    staleness_distribution: list = field(default_factory=list)
     
     def to_dict(self):
         return asdict(self)
@@ -58,7 +64,7 @@ class TrainingResult:
         if output_dir is None:
             output_dir = Path.home() / "training_results"
         output_dir.mkdir(parents=True, exist_ok=True)
-        filename = f"training_{self.training_id}.json"
+        filename = f"training_async_{self.training_id}.json"
         filepath = output_dir / filename
         with open(filepath, 'w') as f:
             json.dump(self.to_dict(), f, indent=2, default=str)
@@ -66,8 +72,8 @@ class TrainingResult:
         return filepath
     
     def print_summary(self):
-        print("\n" + "=" * 70)
-        print("RESUMEN DEL ENTRENAMIENTO")
+        print("\\n" + "=" * 70)
+        print("RESUMEN DEL ENTRENAMIENTO ASINCRONO")
         print("=" * 70)
         print(f"   ID:              {self.training_id}")
         print(f"   Inicio:          {self.start_time}")
@@ -76,17 +82,20 @@ class TrainingResult:
         print("-" * 70)
         print(f"   Dataset:         {self.dataset.upper()}")
         print(f"   Workers:         {self.num_workers}")
-        print(f"   Epocas:          {self.total_epochs_completed} / {self.max_epochs}")
+        print(f"   Updates:         {self.total_updates} / {self.max_updates}")
         print(f"   Batch size:      {self.batch_size}")
         print(f"   Learning rate:   {self.learning_rate}")
         print("-" * 70)
-        print(f"   Total updates:   {self.total_updates}")
         print(f"   Loss final:      {self.final_loss:.6f}")
         print(f"   Accuracy final:  {self.final_accuracy:.2f}%")
+        print(f"   Tiempo/update:   {self.avg_update_seconds:.3f}s")
         print("-" * 70)
         print("   Hardware de workers:")
         for wid, hw in self.worker_hardware.items():
-            print(f"      Worker {wid}: {hw.get('cpu', 'Unknown')} ({hw.get('tier', '?')})")
+            updates = self.worker_updates.get(wid, 0)
+            staleness = self.worker_staleness_avg.get(wid, 0.0)
+            print(f"      Worker {wid}: {hw.get('cpu', 'Unknown')} | "
+                  f"Updates: {updates} | Staleness avg: {staleness:.2f}")
         print("=" * 70)
     
     def _format_time(self, seconds: float) -> str:
@@ -165,39 +174,6 @@ class EfficientNetLite0(nn.Module):
         x = self.stem(x); x = self.blocks(x); x = self.head(x); x = x.view(x.size(0), -1); x = self.classifier(x); return x
 
 
-# ==================== DATASET MANAGER ====================
-@dataclass
-class DistributedDatasetManager:
-    total_samples: int = 50000
-    batch_size: int = 16
-    num_workers: int = 1
-    chunk_size: int = 10
-    seed: int = 42
-    total_batches: int = field(init=False)
-    total_chunks: int = field(init=False)
-    chunks_per_worker: int = field(init=False)
-    current_epoch: int = field(default=0)
-    epoch_assignments: dict = field(default_factory=dict)
-    
-    def __post_init__(self):
-        self.total_batches = (self.total_samples + self.batch_size - 1) // self.batch_size
-        self.total_chunks = (self.total_batches + self.chunk_size - 1) // self.chunk_size
-        self.chunks_per_worker = self.total_chunks // self.num_workers
-    
-    def generate_epoch_assignment(self, epoch: int) -> dict:
-        rng = random.Random(self.seed + epoch)
-        all_chunks = list(range(self.total_chunks))
-        rng.shuffle(all_chunks)
-        assignment = {}
-        base = self.chunks_per_worker
-        for w in range(self.num_workers):
-            start = w * base
-            end = start + base if w < self.num_workers - 1 else len(all_chunks)
-            assignment[w] = sorted(all_chunks[start:end])
-        self.epoch_assignments[epoch] = assignment
-        return assignment
-
-
 # ==================== PROTOCOLO ====================
 async def send_msg(writer, data):
     payload = pickle.dumps(data)
@@ -212,19 +188,32 @@ async def recv_msg(reader):
     return pickle.loads(payload)
 
 
-# ==================== SERVIDOR ====================
-class AsyncDistServer:
-    def __init__(self, host='0.0.0.0', port=5000, num_workers=1, 
+# ==================== SERVIDOR 100% ASINCRONO ====================
+class AsyncServer:
+    """
+    Servidor completamente asincrono:
+    - Recibe gradientes de CUALQUIER worker en CUALQUIER momento
+    - Aplica inmediatamente con staleness weighting
+    - NUNCA espera a ningun worker
+    - Workers reciben modelo actualizado instantaneamente
+    """
+    
+    def __init__(self, host='0.0.0.0', port=5000, num_workers=2, 
                  num_classes=10, lr=0.001, dataset='cifar10',
-                 batch_size=16, chunk_size=10, max_epochs=10,
-                 save_results=True, results_dir=None):
+                 batch_size=16, max_updates=1000,
+                 save_results=True, results_dir=None,
+                 max_staleness=10,  # Rechazar gradientes con staleness > max_staleness
+                 staleness_penalty='linear'):  # 'linear', 'exponential', 'constant'
+        
         self.host = host
         self.port = port
         self.num_workers = num_workers
         self.lr = lr
         self.dataset = dataset
         self.batch_size = batch_size
-        self.max_epochs = max_epochs
+        self.max_updates = max_updates
+        self.max_staleness = max_staleness
+        self.staleness_penalty = staleness_penalty
         self.save_results = save_results
         
         if results_dir:
@@ -232,49 +221,259 @@ class AsyncDistServer:
         else:
             project_dir = Path(__file__).parent.resolve()
             self.results_dir = project_dir / "Resultados"
+        self.results_dir.mkdir(parents=True, exist_ok=True)
         
+        # Modelo global
         self.model = EfficientNetLite0(num_classes=num_classes)
         self.optimizer = torch.optim.SGD(self.model.parameters(), lr=lr, momentum=0.9)
         
-        if dataset == 'cifar10':
-            total_samples = 50000
-        else:
-            total_samples = 10000
-        self.dataset_manager = DistributedDatasetManager(
-            total_samples=total_samples, batch_size=batch_size,
-            num_workers=num_workers, chunk_size=chunk_size, seed=42
-        )
+        # Version tracking - CADA parametro tiene un contador de version
+        self.model_version = 0
+        self.param_versions = {}
+        for name, param in self.model.named_parameters():
+            self.param_versions[name] = 0
         
-        self.workers = {}
+        # Workers
+        self.workers = {}  # worker_id -> (reader, writer)
         self.worker_info = {}
         self.lock = asyncio.Lock()
         self.all_connected = asyncio.Event()
+        self._training_started = False
+        self._training_done = asyncio.Event()
         
-        self.global_step = 0
+        # Estadisticas por worker
+        self.worker_update_count = {}
+        self.worker_staleness_sum = {}
+        self.worker_last_version = {}  # Ultima version que vio cada worker
+        
+        # Cola de gradientes (thread-safe para el aplicador)
+        self.gradient_queue = asyncio.Queue(maxsize=1000)
         self.total_updates = 0
-        self.current_epoch = 0
+        self.update_times = deque(maxlen=100)
         
+        # Resultados
         self.result = TrainingResult()
         self.result.training_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.result.num_workers = num_workers
         self.result.num_classes = num_classes
         self.result.batch_size = batch_size
-        self.result.chunk_size = chunk_size
-        self.result.max_epochs = max_epochs
+        self.result.max_updates = max_updates
         self.result.learning_rate = lr
         self.result.dataset = dataset
         
         self.start_time = None
-        self.epoch_start_times = {}
-        self.epoch_losses = {}
+        self.last_eval_time = 0
+        self.eval_interval = 50  # Evaluar cada 50 updates
+        
+        # Checkpoint
+        self.checkpoint_dir = self.results_dir / "checkpoints"
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self.checkpoint_path = self.checkpoint_dir / f"checkpoint_async_{self.result.training_id}.pt"
+        self._saved_emergency = False
+
+    def save_emergency_checkpoint(self):
+        if self._saved_emergency:
+            return True
+        try:
+            logger.warning("=" * 60)
+            logger.warning("GUARDANDO CHECKPOINT DE EMERGENCIA...")
+            checkpoint = {
+                'model_state_dict': self.model.state_dict(),
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                'model_version': self.model_version,
+                'param_versions': self.param_versions,
+                'total_updates': self.total_updates,
+                'training_id': self.result.training_id,
+                'update_history': self.result.update_history,
+                'timestamp': datetime.now().isoformat(),
+            }
+            torch.save(checkpoint, self.checkpoint_path)
+            self._saved_emergency = True
+            logger.warning(f"Checkpoint guardado: {self.checkpoint_path}")
+            logger.warning("=" * 60)
+            return True
+        except Exception as e:
+            logger.error(f"ERROR guardando checkpoint: {e}")
+            return False
+
+    def setup_signal_handlers(self):
+        def signal_handler(signum, frame):
+            sig_name = signal.Signals(signum).name if hasattr(signal, 'Signals') else str(signum)
+            logger.warning(f"SENAL RECIBIDA: {sig_name}")
+            self.save_emergency_checkpoint()
+            raise KeyboardInterrupt(f"Signal {sig_name}")
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+
+    def compute_staleness_weight(self, staleness):
+        """
+        Calcula el peso de un gradiente segun su staleness.
+        - staleness=0 (gradiente fresco): peso = 1.0
+        - staleness alto: peso reducido
+        """
+        if staleness <= 0:
+            return 1.0
+        
+        if self.staleness_penalty == 'linear':
+            # Pesos: 1.0, 0.9, 0.8, 0.7, ... hasta 0.1 minimo
+            weight = max(0.1, 1.0 - (staleness * 0.1))
+        elif self.staleness_penalty == 'exponential':
+            # Pesos: 1.0, 0.5, 0.25, 0.125, ...
+            weight = max(0.05, 0.5 ** staleness)
+        elif self.staleness_penalty == 'constant':
+            # Sin penalizacion (peligroso pero util para comparar)
+            weight = 1.0
+        else:
+            weight = max(0.1, 1.0 - (staleness * 0.1))
+        
+        return weight
+
+    def apply_gradient_update(self, gradients, worker_id, worker_version, loss):
+        """
+        Aplica UN gradiente al modelo global con staleness weighting.
+        Se llama inmediatamente al recibir un gradiente.
+        """
+        # Calcular staleness: diferencia entre version actual y version usada por el worker
+        staleness = self.model_version - worker_version
+        
+        # Rechazar si es demasiado viejo
+        if staleness > self.max_staleness:
+            logger.warning(f"Worker {worker_id}: gradiente RECHAZADO (staleness={staleness} > max={self.max_staleness})")
+            return False, staleness
+        
+        # Calcular peso segun staleness
+        weight = self.compute_staleness_weight(staleness)
+        
+        # Aplicar gradiente
+        self.optimizer.zero_grad()
+        
+        valid_params = 0
+        for name, param in self.model.named_parameters():
+            if name in gradients:
+                # Aplicar peso por staleness
+                weighted_grad = gradients[name] * weight
+                param.grad = weighted_grad
+                valid_params += 1
+                # Actualizar version de este parametro
+                self.param_versions[name] = self.model_version + 1
+        
+        if valid_params > 0:
+            self.optimizer.step()
+            self.model_version += 1
+            self.total_updates += 1
+            
+            # Estadisticas
+            self.worker_update_count[worker_id] = self.worker_update_count.get(worker_id, 0) + 1
+            self.worker_staleness_sum[worker_id] = self.worker_staleness_sum.get(worker_id, 0) + staleness
+            
+            # Logging cada 10 updates
+            if self.total_updates % 10 == 0:
+                logger.info(f"Update #{self.total_updates} | Worker {worker_id} | "
+                           f"Staleness: {staleness} | Weight: {weight:.3f} | Loss: {loss:.4f}")
+            
+            return True, staleness
+        
+        return False, staleness
+
+    async def gradient_processor_task(self):
+        """
+        Tarea asincrona que procesa gradientes de la cola continuamente.
+        Corre en paralelo con las conexiones de workers.
+        """
+        logger.info("Iniciando procesador de gradientes...")
+        
+        while self.total_updates < self.max_updates and not self._training_done.is_set():
+            try:
+                # Esperar gradiente con timeout para poder checkear condiciones
+                grad_data = await asyncio.wait_for(self.gradient_queue.get(), timeout=1.0)
+                
+                update_start = time.time()
+                success, staleness = self.apply_gradient_update(
+                    grad_data['gradients'],
+                    grad_data['worker_id'],
+                    grad_data['model_version'],
+                    grad_data['loss']
+                )
+                update_time = time.time() - update_start
+                self.update_times.append(update_time)
+                
+                if success:
+                    # Guardar en historial cada 5 updates
+                    if self.total_updates % 5 == 0:
+                        self.result.update_history.append({
+                            'update': self.total_updates,
+                            'worker_id': grad_data['worker_id'],
+                            'loss': round('loss', 6) if 'loss' in dir() else 0.0,
+                            'staleness': staleness,
+                            'model_version': self.model_version,
+                            'timestamp': datetime.now().isoformat()
+                        })
+                    
+                    # Evaluar modelo periodicamente
+                    if self.total_updates % self.eval_interval == 0 and self.total_updates > 0:
+                        await self.evaluate_and_log()
+                
+                # Notificar al worker que su gradiente fue procesado (enviar modelo actualizado)
+                await self.send_model_to_worker(grad_data['worker_id'])
+                
+            except asyncio.TimeoutError:
+                continue
+            except Exception as e:
+                logger.error(f"Error en gradient processor: {e}")
+        
+        logger.info(f"Gradient processor terminado. Total updates: {self.total_updates}")
+
+    async def send_model_to_worker(self, worker_id):
+        """Envia el modelo actualizado a un worker especifico."""
+        if worker_id not in self.workers:
+            return
+        
+        try:
+            _, writer = self.workers[worker_id]
+            
+            # Solo enviar pesos entrenables (no BatchNorm stats)
+            trainable_state = {}
+            for name, param in self.model.named_parameters():
+                trainable_state[name] = param.detach().cpu().clone()
+            
+            msg = {
+                'type': 'model_update',
+                'model_version': self.model_version,
+                'state_dict': trainable_state,
+                'total_updates': self.total_updates,
+                'max_updates': self.max_updates
+            }
+            
+            await send_msg(writer, msg)
+            self.worker_last_version[worker_id] = self.model_version
+            
+        except Exception as e:
+            logger.warning(f"Error enviando modelo a worker {worker_id}: {e}")
+
+    async def broadcast_model_to_all(self):
+        """Envia modelo actualizado a TODOS los workers conectados."""
+        tasks = []
+        for worker_id in list(self.workers.keys()):
+            tasks.append(self.send_model_to_worker(worker_id))
+        
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def handle_worker(self, reader, writer):
+        """
+        Maneja la conexion con un worker.
+        - Handshake inicial
+        - Recibe gradientes continuamente
+        - NUNCA bloquea al worker
+        """
         addr = writer.get_extra_info('peername')
         worker_id = None
         
         try:
+            # Handshake
             msg = await recv_msg(reader)
             if msg['type'] != 'handshake':
+                logger.warning(f"Handshake invalido de {addr}")
                 return
             
             hardware_info = msg.get('hardware', 'unknown')
@@ -285,31 +484,35 @@ class AsyncDistServer:
                 self.worker_info[worker_id] = {
                     'hardware': hardware_info,
                     'connected_at': datetime.now().isoformat(),
-                    'addr': addr,
-                    'updates_received': 0
+                    'addr': addr
                 }
                 self.result.worker_hardware[worker_id] = hardware_info
+                self.worker_update_count[worker_id] = 0
+                self.worker_staleness_sum[worker_id] = 0
+                self.worker_last_version[worker_id] = 0
                 logger.info(f"Worker {worker_id} conectado | {hardware_info.get('cpu', 'Unknown')}")
             
+            # Enviar configuracion
             await send_msg(writer, {
                 'type': 'assign_id',
                 'worker_id': worker_id,
                 'total_workers': self.num_workers,
                 'batch_size': self.batch_size,
-                'chunk_size': self.dataset_manager.chunk_size,
-                'total_samples': self.dataset_manager.total_samples,
                 'dataset': self.dataset,
-                'max_epochs': self.max_epochs
+                'max_updates': self.max_updates,
+                'model_version': self.model_version
             })
             
+            # Esperar todos los workers para iniciar
             if len(self.workers) == self.num_workers:
                 self.start_time = time.time()
                 self.result.start_time = datetime.now().isoformat()
                 logger.info("=" * 70)
-                logger.info("TODOS LOS WORKERS CONECTADOS")
+                logger.info("TODOS LOS WORKERS CONECTADOS - MODO ASINCRONO")
                 logger.info(f"   Training ID: {self.result.training_id}")
-                logger.info(f"   Epocas: {self.max_epochs}")
-                logger.info(f"   Inicio: {self.result.start_time}")
+                logger.info(f"   Max updates: {self.max_updates}")
+                logger.info(f"   Staleness penalty: {self.staleness_penalty}")
+                logger.info(f"   Max staleness: {self.max_staleness}")
                 logger.info("=" * 70)
                 self.all_connected.set()
             else:
@@ -317,165 +520,106 @@ class AsyncDistServer:
                 logger.info(f"Esperando {remaining} worker(s)...")
                 await self.all_connected.wait()
             
-            await self.broadcast_epoch_start(epoch=0)
+            # Enviar modelo inicial
+            await self.send_model_to_worker(worker_id)
             
-            while True:
-                msg = await recv_msg(reader)
-                
-                if msg['type'] == 'gradients':
-                    worker_grads = msg['gradients']
-                    step = msg['step']
-                    loss = msg.get('loss', 0.0)
-                    epoch = msg.get('epoch', 0)
+            # Bucle principal: recibir gradientes SIN BLOQUEAR
+            while self.total_updates < self.max_updates and not self._training_done.is_set():
+                try:
+                    msg = await asyncio.wait_for(recv_msg(reader), timeout=30.0)
                     
-                    async with self.lock:
-                        self.apply_gradients(worker_grads)
-                        self.total_updates += 1
-                        self.global_step = step
-                        self.worker_info[worker_id]['updates_received'] += 1
+                    if msg['type'] == 'gradient':
+                        # Recibimos un gradiente - lo ponemos en la cola y seguimos
+                        # NO bloqueamos al worker esperando a otros
+                        grad_data = {
+                            'gradients': msg['gradients'],
+                            'worker_id': worker_id,
+                            'model_version': msg.get('model_version', 0),
+                            'loss': msg.get('loss', 0.0),
+                            'timestamp': time.time()
+                        }
                         
-                        if epoch not in self.epoch_losses:
-                            self.epoch_losses[epoch] = []
-                        self.epoch_losses[epoch].append(loss)
+                        try:
+                            self.gradient_queue.put_nowait(grad_data)
+                            # Confirmar recepcion inmediata
+                            await send_msg(writer, {
+                                'type': 'gradient_received',
+                                'queue_size': self.gradient_queue.qsize(),
+                                'model_version': self.model_version
+                            })
+                        except asyncio.QueueFull:
+                            logger.warning("Cola de gradientes llena - descartando gradiente")
+                            await send_msg(writer, {
+                                'type': 'gradient_rejected',
+                                'reason': 'queue_full'
+                            })
+                    
+                    elif msg['type'] == 'request_model':
+                        # Worker pide modelo actualizado
+                        await self.send_model_to_worker(worker_id)
+                    
+                    elif msg['type'] == 'done':
+                        logger.info(f"Worker {worker_id} solicito finalizacion")
+                        break
                         
-                        logger.info(f"W{worker_id} | Ep{epoch}/{self.max_epochs} | Loss:{loss:.4f} | Updates:{self.total_updates}")
-                    
-                    await self.send_model_to_worker(writer, epoch=epoch)
-                    
-                elif msg['type'] == 'epoch_complete':
-                    completed_epoch = msg['epoch']
-                    avg_loss = msg.get('avg_loss', 0.0)
-                    
-                    epoch_end_time = time.time()
-                    if completed_epoch in self.epoch_start_times:
-                        epoch_duration = epoch_end_time - self.epoch_start_times[completed_epoch]
-                    else:
-                        epoch_duration = 0.0
-                    
-                    self.result.epoch_history.append({
-                        'epoch': completed_epoch,
-                        'avg_loss': avg_loss,
-                        'duration_seconds': round(epoch_duration, 2),
-                        'timestamp': datetime.now().isoformat()
-                    })
-                    
-                    logger.info(f"Worker {worker_id} completo epoca {completed_epoch}/{self.max_epochs} ({epoch_duration:.1f}s)")
-                    
-                    async with self.lock:
-                        self.worker_info[worker_id]['last_completed_epoch'] = completed_epoch
-                        all_done = all(
-                            self.worker_info.get(w, {}).get('last_completed_epoch', -1) >= completed_epoch
-                            for w in self.workers
-                        )
-                    
-                    if all_done and completed_epoch < self.max_epochs - 1:
-                        next_epoch = completed_epoch + 1
-                        logger.info(f"Iniciando epoca {next_epoch}/{self.max_epochs}")
-                        await self.broadcast_epoch_start(epoch=next_epoch)
-                        
-                    elif all_done and completed_epoch >= self.max_epochs - 1:
-                        await self.finish_training()
-                        await self.broadcast_training_done()
-                    
-                elif msg['type'] == 'heartbeat':
-                    await send_msg(writer, {'type': 'heartbeat_ack'})
-                    
-                elif msg['type'] == 'done':
-                    logger.info(f"Worker {worker_id} finalizo")
-                    break
-                    
+                except asyncio.TimeoutError:
+                    # Enviar heartbeat
+                    try:
+                        await send_msg(writer, {'type': 'heartbeat', 'model_version': self.model_version})
+                    except:
+                        break
+                    continue
+            
+            # Training completado
+            if self.total_updates >= self.max_updates and not self._training_done.is_set():
+                logger.info("Max updates alcanzado!")
+                self._training_done.set()
+                await self.finish_training()
+                await self.broadcast_training_done()
+            
         except asyncio.IncompleteReadError:
             logger.warning(f"Worker {worker_id} desconectado")
         except Exception as e:
             logger.error(f"Error Worker {worker_id}: {e}")
+            import traceback
+            traceback.print_exc()
         finally:
             if worker_id is not None:
                 async with self.lock:
                     if worker_id in self.workers:
                         del self.workers[worker_id]
-                    if worker_id in self.worker_info:
-                        del self.worker_info[worker_id]
-            writer.close()
-            await writer.wait_closed()
-
-    def apply_gradients(self, worker_grads):
-        self.optimizer.zero_grad()
-        for name, param in self.model.named_parameters():
-            if name in worker_grads:
-                grad_tensor = worker_grads[name]
-                if param.grad is None:
-                    param.grad = grad_tensor.clone()
-                else:
-                    param.grad += grad_tensor
-        self.optimizer.step()
-
-    async def broadcast_epoch_start(self, epoch: int):
-        self.epoch_start_times[epoch] = time.time()
-        self.current_epoch = epoch
-        
-        assignment = self.dataset_manager.generate_epoch_assignment(epoch)
-        state_dict = self.model.state_dict()
-        
-        msg = {
-            'type': 'epoch_start',
-            'epoch': epoch,
-            'state_dict': state_dict,
-            'global_step': self.global_step,
-            'chunk_assignment': assignment,
-            'max_epochs': self.max_epochs
-        }
-        
-        tasks = [send_msg(w, msg) for _, (_, w) in self.workers.items()]
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-            logger.info(f"Epoca {epoch}/{self.max_epochs} iniciada")
+            try:
+                writer.close()
+                await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
+            except:
+                pass
 
     async def broadcast_training_done(self):
-        msg = {
-            'type': 'training_done',
-            'total_epochs': self.max_epochs,
-            'total_updates': self.total_updates
-        }
-        tasks = [send_msg(w, msg) for _, (_, w) in self.workers.items()]
+        msg = {'type': 'training_done'}
+        tasks = []
+        for _, (_, w) in list(self.workers.items()):
+            try:
+                tasks.append(send_msg(w, msg))
+            except:
+                pass
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def finish_training(self):
-        logger.info("FINALIZANDO ENTRENAMIENTO...")
-        
-        end_time = time.time()
-        total_seconds = end_time - self.start_time if self.start_time else 0
-        
-        final_loss = 0.0
-        if self.max_epochs - 1 in self.epoch_losses and self.epoch_losses[self.max_epochs - 1]:
-            final_loss = sum(self.epoch_losses[self.max_epochs - 1]) / len(self.epoch_losses[self.max_epochs - 1])
-        elif self.epoch_losses:
-            last_epoch = max(self.epoch_losses.keys())
-            final_loss = sum(self.epoch_losses[last_epoch]) / len(self.epoch_losses[last_epoch])
-        
-        final_accuracy = await self.evaluate_model()
-        
-        self.result.end_time = datetime.now().isoformat()
-        self.result.total_seconds = round(total_seconds, 2)
-        self.result.total_epochs_completed = len(self.result.epoch_history)
-        self.result.total_updates = self.total_updates
-        self.result.final_loss = round(final_loss, 6)
-        self.result.final_accuracy = round(final_accuracy, 2)
-        
-        if self.result.epoch_history:
-            total_epoch_time = sum(e.get('duration_seconds', 0) for e in self.result.epoch_history)
-            self.result.avg_epoch_seconds = round(total_epoch_time / len(self.result.epoch_history), 2)
-        
-        for wid, info in self.worker_info.items():
-            self.result.worker_updates[wid] = info.get('updates_received', 0)
-        
-        self.result.print_summary()
-        
-        if self.save_results:
-            filepath = self.result.save(self.results_dir)
-            logger.info(f"Resultados guardados en: {filepath}")
-        
-        return self.result
+    async def evaluate_and_log(self):
+        """Evalua el modelo y guarda metricas."""
+        try:
+            accuracy = await self.evaluate_model()
+            logger.info(f"Evaluacion update #{self.total_updates}: Accuracy = {accuracy:.2f}%")
+            
+            # Guardar en historial
+            self.result.update_history.append({
+                'update': self.total_updates,
+                'eval_accuracy': round(accuracy, 2),
+                'model_version': self.model_version,
+                'timestamp': datetime.now().isoformat()
+            })
+        except Exception as e:
+            logger.warning(f"Error en evaluacion: {e}")
 
     async def evaluate_model(self) -> float:
         try:
@@ -507,60 +651,101 @@ class AsyncDistServer:
                     correct += (predicted == target).sum().item()
             
             accuracy = 100 * correct / total
-            logger.info(f"Accuracy en test set: {accuracy:.2f}% ({correct}/{total})")
             return accuracy
-            
         except Exception as e:
-            logger.warning(f"No se pudo evaluar accuracy: {e}")
+            logger.warning(f"No se pudo evaluar: {e}")
             return 0.0
 
-    async def send_model_to_worker(self, writer, epoch: int = 0):
-        state_dict = self.model.state_dict()
-        await send_msg(writer, {
-            'type': 'model_update',
-            'state_dict': state_dict,
-            'global_step': self.global_step,
-            'epoch': epoch,
-            'max_epochs': self.max_epochs
-        })
+    async def finish_training(self):
+        logger.info("FINALIZANDO ENTRENAMIENTO ASINCRONO...")
+        
+        end_time = time.time()
+        total_seconds = end_time - self.start_time if self.start_time else 0
+        
+        final_accuracy = await self.evaluate_model()
+        
+        # Calcular loss promedio de los ultimos updates
+        recent_losses = [h.get('loss', 0) for h in self.result.update_history[-20:] if 'loss' in h]
+        final_loss = sum(recent_losses) / len(recent_losses) if recent_losses else 0.0
+        
+        self.result.end_time = datetime.now().isoformat()
+        self.result.total_seconds = round(total_seconds, 2)
+        self.result.total_updates = self.total_updates
+        self.result.final_loss = round(final_loss, 6)
+        self.result.final_accuracy = round(final_accuracy, 2)
+        
+        if self.update_times:
+            self.result.avg_update_seconds = round(sum(self.update_times) / len(self.update_times), 3)
+        
+        for wid in self.worker_update_count:
+            self.result.worker_updates[wid] = self.worker_update_count[wid]
+            if self.worker_update_count[wid] > 0:
+                self.result.worker_staleness_avg[wid] = round(
+                    self.worker_staleness_sum[wid] / self.worker_update_count[wid], 2
+                )
+        
+        self.result.print_summary()
+        
+        if self.save_results:
+            self.result.save(self.results_dir)
+        
+        return self.result
 
     async def start(self):
+        self.setup_signal_handlers()
+        
+        # Iniciar el procesador de gradientes en segundo plano
+        processor_task = asyncio.create_task(self.gradient_processor_task())
+        
         server = await asyncio.start_server(self.handle_worker, self.host, self.port)
         addrs = ', '.join(str(sock.getsockname()) for sock in server.sockets)
         
         logger.info("=" * 70)
-        logger.info("SERVIDOR DE ENTRENAMIENTO DISTRIBUIDO")
+        logger.info("SERVIDOR 100% ASINCRONO")
         logger.info(f"   Training ID: {self.result.training_id}")
-        logger.info(f"   Modelo: EfficientNetLite-0")
-        logger.info(f"   Dataset: {self.dataset.upper()}")
-        logger.info(f"   Workers: {self.num_workers}")
-        logger.info(f"   Epocas: {self.max_epochs}")
-        logger.info(f"   Resultados en: {self.results_dir}")
+        logger.info(f"   Checkpoints: {self.checkpoint_dir}")
         logger.info(f"   Escuchando en: {addrs}")
+        logger.info(f"   Staleness penalty: {self.staleness_penalty}")
+        logger.info(f"   Max staleness: {self.max_staleness}")
         logger.info("=" * 70)
         
-        async with server:
-            await server.serve_forever()
+        try:
+            async with server:
+                await server.serve_forever()
+        except KeyboardInterrupt:
+            logger.info("Interrupcion detectada")
+            self.save_emergency_checkpoint()
+            processor_task.cancel()
+            try:
+                await processor_task
+            except asyncio.CancelledError:
+                pass
+            raise
 
 
 # ==================== MAIN ====================
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Servidor de entrenamiento distribuido')
-    parser.add_argument('--host', default='0.0.0.0', help='Host')
-    parser.add_argument('--port', type=int, default=5000, help='Puerto')
-    parser.add_argument('--workers', type=int, default=1, help='Workers')
-    parser.add_argument('--num-classes', type=int, default=10, help='Clases')
-    parser.add_argument('--lr', type=float, default=0.001, help='LR')
+    parser = argparse.ArgumentParser(description='Servidor 100% Asincrono')
+    parser.add_argument('--host', default='0.0.0.0')
+    parser.add_argument('--port', type=int, default=5000)
+    parser.add_argument('--workers', type=int, default=2)
+    parser.add_argument('--num-classes', type=int, default=10)
+    parser.add_argument('--lr', type=float, default=0.001)
     parser.add_argument('--dataset', default='cifar10', choices=['cifar10', 'synthetic'])
-    parser.add_argument('--batch-size', type=int, default=32)
-    parser.add_argument('--chunk-size', type=int, default=10)
-    parser.add_argument('--epochs', type=int, default=1, help='EPOCAS TOTALES')
-    parser.add_argument('--no-save', action='store_true', help='No guardar resultados')
-    parser.add_argument('--results-dir', type=str, help='Directorio para resultados')
+    parser.add_argument('--batch-size', type=int, default=16)
+    parser.add_argument('--max-updates', type=int, default=1000, 
+                        help='Numero maximo de updates (en lugar de epocas)')
+    parser.add_argument('--max-staleness', type=int, default=10,
+                        help='Rechazar gradientes con staleness mayor a este valor')
+    parser.add_argument('--staleness-penalty', default='linear',
+                        choices=['linear', 'exponential', 'constant'],
+                        help='Tipo de penalizacion por staleness')
+    parser.add_argument('--no-save', action='store_true')
+    parser.add_argument('--results-dir', type=str)
     
     args = parser.parse_args()
     
-    server = AsyncDistServer(
+    server = AsyncServer(
         host=args.host,
         port=args.port,
         num_workers=args.workers,
@@ -568,8 +753,9 @@ if __name__ == '__main__':
         lr=args.lr,
         dataset=args.dataset,
         batch_size=args.batch_size,
-        chunk_size=args.chunk_size,
-        max_epochs=args.epochs,
+        max_updates=args.max_updates,
+        max_staleness=args.max_staleness,
+        staleness_penalty=args.staleness_penalty,
         save_results=not args.no_save,
         results_dir=args.results_dir
     )
@@ -577,6 +763,4 @@ if __name__ == '__main__':
     try:
         asyncio.run(server.start())
     except KeyboardInterrupt:
-        logger.info("Servidor detenido")
-        if server.save_results and server.start_time:
-            asyncio.run(server.finish_training())
+        logger.info("Programa terminado")

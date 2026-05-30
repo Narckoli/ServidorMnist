@@ -1,0 +1,70 @@
+{
+  "training_id": "20260530_015804",
+  "current_epoch": 10,
+  "total_updates": 10,
+  "max_epochs": 10,
+  "epoch_history": [
+    {
+      "epoch": 0,
+      "avg_loss": 2.31914,
+      "duration_seconds": 4285.95,
+      "timestamp": "2026-05-30T03:12:31.632292"
+    },
+    {
+      "epoch": 1,
+      "avg_loss": 4.438794,
+      "duration_seconds": 4398.96,
+      "timestamp": "2026-05-30T04:25:50.589070"
+    },
+    {
+      "epoch": 2,
+      "avg_loss": 8.362496,
+      "duration_seconds": 4562.01,
+      "timestamp": "2026-05-30T05:41:52.594868"
+    },
+    {
+      "epoch": 3,
+      "avg_loss": 9.368829,
+      "duration_seconds": 4329.32,
+      "timestamp": "2026-05-30T06:54:01.913306"
+    },
+    {
+      "epoch": 4,
+      "avg_loss": 13.460443,
+      "duration_seconds": 4301.21,
+      "timestamp": "2026-05-30T08:05:43.125957"
+    },
+    {
+      "epoch": 5,
+      "avg_loss": 24.68616,
+      "duration_seconds": 4448.61,
+      "timestamp": "2026-05-30T09:19:51.732632"
+    },
+    {
+      "epoch": 6,
+      "avg_loss": 33.956145,
+      "duration_seconds": 4151.59,
+      "timestamp": "2026-05-30T10:29:03.325327"
+    },
+    {
+      "epoch": 7,
+      "avg_loss": 31.615367,
+      "duration_seconds": 4364.92,
+      "timestamp": "2026-05-30T11:41:48.250467"
+    },
+    {
+      "epoch": 8,
+      "avg_loss": 23.001857,
+      "duration_seconds": 4288.92,
+      "timestamp": "2026-05-30T12:53:17.174955"
+    },
+    {
+      "epoch": 9,
+      "avg_loss": 40.410127,
+      "duration_seconds": 4309.32,
+      "timestamp": "2026-05-30T14:05:06.491724"
+    }
+  ],
+  "timestamp": "2026-05-30T14:42:45.541003",
+  "is_emergency": true
+}
